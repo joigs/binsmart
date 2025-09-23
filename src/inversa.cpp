@@ -176,7 +176,7 @@ int main(int argc, char** argv){
     for(long step=0; step<pasos; ++step){
         auto [line, under] = m.view();
         cout << line << "\n" << under << "\n";
-        cout << "Paso " << step << " | Estado=" << to_string_state(m.q) << "\n";
+        cout << "Paso " << step + 1 << " | Estado=" << to_string_state(m.q) << "\n \n ------------- \n";
         m.step();
     }
 

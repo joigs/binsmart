@@ -1,19 +1,16 @@
-#include <array>
-#include <deque>
-#include <iostream>
+#include <vector>
 #include <string>
+#include <iostream>
 #include <algorithm>
+#include <limits>
 
 using namespace std;
 
-
+//./original <n_pasos> <palabra> <indice_cabezal> <estado>
 enum class State : uint8_t { S1D, S1D_PR, S1G, S1G_PR, S3D, S3D_PR, S3G, S3G_PR };
 
 static inline bool isD(State s){
     return s==State::S1D || s==State::S1D_PR || s==State::S3D || s==State::S3D_PR;
-}
-static inline bool isG(State s){
-    return s==State::S1G || s==State::S1G_PR || s==State::S3G || s==State::S3G_PR;
 }
 static inline int move_from(State next){ return isD(next)? +1 : -1; }
 
@@ -30,7 +27,6 @@ static string to_string_state(State s){
     }
     return "?";
 }
-
 static bool parse_state(string s, State& out){
     for(char& c: s) c = (char)toupper((unsigned char)c);
     if(s=="1D")  { out=State::S1D; return true; }
@@ -46,103 +42,142 @@ static bool parse_state(string s, State& out){
 
 
 struct Rule { char write; State next; };
-
-static constexpr array<array<Rule,2>,8> T = {
-    {{{ {'1', State::S1D_PR}, {'1', State::S3G_PR} }},
-        {{ {'1', State::S1G   }, {'1', State::S3G   } }},
-        {{ {'1', State::S1G_PR}, {'1', State::S3D_PR} }},
-        {{ {'1', State::S1D   }, {'1', State::S3D   } }},
-        {{ {'0', State::S1D   }, {'0', State::S3D_PR} }},
-        {{ {'0', State::S3G   }, {'0', State::S1D_PR} }},
-        {{ {'0', State::S1G   }, {'0', State::S3G_PR} }},
-        {{ {'0', State::S3D   }, {'0', State::S1G_PR} }},
-}};
-
+static constexpr Rule T[8][2] = {
+    { {'1', State::S1D_PR}, {'1', State::S3G_PR} },
+    { {'1', State::S1G   }, {'1', State::S3G   } },
+    { {'1', State::S1G_PR}, {'1', State::S3D_PR} },
+    { {'1', State::S1D   }, {'1', State::S3D   } },
+    { {'0', State::S1D   }, {'0', State::S3D_PR} },
+    { {'0', State::S3G   }, {'0', State::S1D_PR} },
+    { {'0', State::S1G   }, {'0', State::S3G_PR} },
+    { {'0', State::S3D   }, {'0', State::S1G_PR} },
+};
 
 struct TMH {
-    deque<char> tape;
+    vector<char> left, right;
     long h;
     State q;
+    long min1, max1;
 
-    TMH(const string& word, long head_index, State q0)
-        : tape(word.begin(), word.end()), h(head_index), q(q0)
-    { if(tape.empty()) tape.push_back('0'); }
-
-    inline void ensure_cell(long idx){
-        if(idx < 0){
-            while(idx < 0){ tape.push_front('0'); ++idx; ++h; }
+    TMH(const string& word, long head_index, State q0): h(head_index), q(q0) {
+        right.reserve(max<size_t>(word.size(), 16));
+        right.assign(word.begin(), word.end());
+        min1 = numeric_limits<long>::max();
+        max1 = numeric_limits<long>::min();
+        for(size_t i=0;i<word.size();++i){
+            if(word[i]=='1'){ if((long)i<min1) min1=(long)i; if((long)i>max1) max1=(long)i; }
         }
-        while(idx >= (long)tape.size()) tape.push_back('0');
+        if(right.empty()) right.push_back('0');
+    }
+
+    inline char& cell(long p){
+        if(p>=0){
+            size_t i=(size_t)p;
+            if(i>=right.size()) right.resize(i+1,'0');
+            return right[i];
+        }else{
+            size_t j=(size_t)(-p-1);
+            if(j>=left.size()) left.resize(j+1,'0');
+            return left[j];
+        }
+    }
+    inline char read(long p) const {
+        if(p>=0){
+            size_t i=(size_t)p;
+            return (i<right.size()? right[i]:'0');
+        }else{
+            size_t j=(size_t)(-p-1);
+            return (j<left.size()? left[j]:'0');
+        }
+    }
+
+    inline void widen1_on_write(long p, char after){
+        if(after=='1'){
+            if(p<min1) min1=p;
+            if(p>max1) max1=p;
+        }else{
+            if(min1<=max1){
+                if(p==min1){
+                    long L = - (long)left.size();
+                    long R = (long)right.size()-1;
+                    bool found=false;
+                    for(long t=min1+1; t<=R; ++t){ if(read(t)=='1'){ min1=t; found=true; break; } }
+                    if(!found){
+                        for(long t=min1-1; t>=L; --t){ if(read(t)=='1'){ min1=t; found=true; break; } }
+                    }
+                    if(!found){ min1=numeric_limits<long>::max(); max1=numeric_limits<long>::min(); }
+                }else if(p==max1){
+                    long L = - (long)left.size();
+                    long R = (long)right.size()-1;
+                    bool found=false;
+                    for(long t=max1-1; t>=L; --t){ if(read(t)=='1'){ max1=t; found=true; break; } }
+                    if(!found){
+                        for(long t=max1+1; t<=R; ++t){ if(read(t)=='1'){ max1=t; found=true; break; } }
+                    }
+                    if(!found){ min1=numeric_limits<long>::max(); max1=numeric_limits<long>::min(); }
+                }
+            }
+        }
     }
 
     inline void step(){
-        ensure_cell(h);
-        char r = tape[(size_t)h];
+        char r = read(h);
         const Rule& rule = T[(int)q][ (r=='0')?0:1 ];
-        tape[(size_t)h] = rule.write;
+        char& ref = cell(h);
+        if(ref!=rule.write){
+            widen1_on_write(h, rule.write);
+            if(ref=='1' && rule.write=='0') widen1_on_write(h, '0');
+            ref = rule.write;
+        }
         q = rule.next;
         h += move_from(q);
-        ensure_cell(h);
+        (void)cell(h);
     }
 
     pair<string,string> view_with_head(){
-        ensure_cell(h);
-
-        size_t n = tape.size();
-        size_t first1 = n, last1 = 0;
-        for(size_t i=0;i<n;i++){ if(tape[i]=='1'){ first1=i; break; } }
-        for(size_t i=n;i>0;i--){ if(tape[i-1]=='1'){ last1=i-1; break; } }
-
-        size_t hh = (size_t)h;
-
-        size_t L, R;
-        if(first1==n){
-            L = hh; R = hh + 1;
-        }else{
-            L = min(first1, hh);
-            R = max(last1, hh) + 1;
-        }
-
-        string line; line.reserve(R-L);
-        for(size_t i=L;i<R;i++) line.push_back(tape[i]);
-
-        string under(hh - L, ' ');
+        (void)cell(h);
+        long L = h, R = h;
+        if(min1<=max1){ if(min1<L) L=min1; if(max1>R) R=max1; }
+        size_t len = (size_t)(R - L + 1);
+        string line; line.resize(len);
+        for(long p=L; p<=R; ++p) line[(size_t)(p-L)] = read(p);
+        string under((size_t)(h - L), ' ');
         under.push_back('^');
-
         return {line, under};
     }
 };
+
 
 int main(int argc, char** argv){
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    if(argc != 5){ cout << "Error\n"; return 1; }
+    if(argc != 5){ cout << "error\n"; return 1; }
 
     long pasos = strtoll(argv[1], nullptr, 10);
     string palabra = argv[2];
     long pos = strtoll(argv[3], nullptr, 10);
     string sstate = argv[4];
 
-    if(pasos <= 0){ cout << "Error\n"; return 1; }
+    if(pasos <= 0){ cout << "error\n"; return 1; }
     if(palabra.empty() || !all_of(palabra.begin(), palabra.end(),
-        [](char c){ return c=='0' || c=='1'; })){ cout << "Error\n"; return 1; }
-    if(pos < 0 || pos >= (long)palabra.size()){ cout << "Error\n"; return 1; }
+        [](char c){ return c=='0' || c=='1'; })){ cout << "error\n"; return 1; }
+    if(pos < 0 || pos >= (long)palabra.size()){ cout << "error\n"; return 1; }
 
     State q0;
-    if(!parse_state(sstate, q0)){ cout << "Error\n"; return 1; }
+    if(!parse_state(sstate, q0)){ cout << "error\n"; return 1; }
 
     TMH m(palabra, pos, q0);
 
     for(long step=0; step<pasos; ++step){
-        auto vw = m.view_with_head();
-        cout << vw.first << "\n" << vw.second << "\n";
-        cout << "Paso " << step << " | Estado=" << to_string_state(m.q) << "\n";
+        auto [line, under] = m.view_with_head();
+        cout << line << "\n" << under << "\n";
+        cout << "Paso " << step + 1 << " | Estado=" << to_string_state(m.q) << "\n \n ------------- \n";
         m.step();
     }
 
-    auto vw = m.view_with_head();
-    cout << vw.first << "\n" << vw.second << "\n";
+    auto [line, under] = m.view_with_head();
+    cout << line << "\n" << under << "\n";
     cout << "Estado=" << to_string_state(m.q) << "\n";
     return 0;
 }
