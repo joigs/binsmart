@@ -1,0 +1,4 @@
+/home/joigs/proyectos/binsmart/build/CMakeFiles/original.dir
+/home/joigs/proyectos/binsmart/build/CMakeFiles/inversa.dir
+/home/joigs/proyectos/binsmart/build/CMakeFiles/edit_cache.dir
+/home/joigs/proyectos/binsmart/build/CMakeFiles/rebuild_cache.dir
