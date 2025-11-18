@@ -32,7 +32,7 @@ static inline bool parse_state(string s, Base& out){
     if(s=="3G'") { out=Base::S3G_PR; return true; }
     return false;
 }
-static inline int mv_from(Base s){ 
+static inline int mv_from(Base s){
     switch(s){
         case Base::S1D: case Base::S1D_PR: case Base::S3D: case Base::S3D_PR: return +1;
         default: return -1;

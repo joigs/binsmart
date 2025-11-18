@@ -8,13 +8,14 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-add_executable(original src/original.cpp)
-add_executable(inversa  src/inversa.cpp)
+add_library(tm STATIC src/tm.cpp)
+target_include_directories(tm PUBLIC src)
 
-if (MSVC)
-    target_compile_options(original PRIVATE /O2 /permissive-)
-    target_compile_options(inversa  PRIVATE /O2 /permissive-)
-else()
-    target_compile_options(original PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
-    target_compile_options(inversa  PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
-endif()
+add_executable(original src/original.cpp)
+target_link_libraries(original PRIVATE tm)
+
+add_executable(inversa src/inversa.cpp)
+target_link_libraries(inversa PRIVATE tm)
+
+add_executable(findH src/findH.cpp)
+target_link_libraries(findH PRIVATE tm)
