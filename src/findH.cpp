@@ -9,8 +9,14 @@
 #include <atomic>
 #include <cmath>
 #include <fstream>
+#include <streambuf>
 
-static bool apply_symbol_CA(const std::string& word, int r, int neighborhood_len, const std::vector<char>& rule_bits, std::string& out) {
+struct NullBuffer : public std::streambuf {
+    int overflow(int c) override { return c; }
+};
+
+static bool apply_symbol_CA(const std::string& word, int r, int neighborhood_len,
+                            const std::vector<char>& rule_bits, std::string& out) {
     int L = static_cast<int>(word.size());
     out.clear();
     out.reserve(L);
@@ -30,7 +36,10 @@ static bool apply_symbol_CA(const std::string& word, int r, int neighborhood_len
     return true;
 }
 
-static bool apply_H_TMT(const std::string& word, int pos, const std::string& qlbl, int r, int neighborhood_len, const std::vector<char>& rule_bits, const std::array<int,8>& perm, std::string& w2, int& pos2, std::string& q2) {
+static bool apply_H_TMT(const std::string& word, int pos, const std::string& qlbl,
+                        int r, int neighborhood_len, const std::vector<char>& rule_bits,
+                        const std::array<int,8>& perm,
+                        std::string& w2, int& pos2, std::string& q2) {
     if (!apply_symbol_CA(word, r, neighborhood_len, rule_bits, w2)) return false;
     int qi = state_index_from_label(qlbl);
     if (qi < 0) return false;
@@ -40,7 +49,8 @@ static bool apply_H_TMT(const std::string& word, int pos, const std::string& qlb
     return true;
 }
 
-static std::string fmt_rule_bits_table(const std::vector<char>& rule_bits, int r, int neighborhood_len) {
+static std::string fmt_rule_bits_table(const std::vector<char>& rule_bits,
+                                       int r, int neighborhood_len) {
     std::ostringstream oss;
     oss << "SIMBOLOS r=" << r << "\n";
     int S = static_cast<int>(rule_bits.size());
@@ -52,20 +62,19 @@ static std::string fmt_rule_bits_table(const std::vector<char>& rule_bits, int r
             char c = (idx & (1 << bitpos)) ? '1' : '0';
             key[b] = c;
         }
-        std::string left;
-        std::string center;
-        std::string right;
+        std::string left, center, right;
         if (K == 3) {
-            left = key.substr(0, 1);
+            left   = key.substr(0, 1);
             center = key.substr(1, 1);
-            right = key.substr(2);
+            right  = key.substr(2);
         } else {
             int mid = K / 2;
-            left = key.substr(0, mid);
+            left   = key.substr(0, mid);
             center = key.substr(mid, 1);
-            right = key.substr(mid + 1);
+            right  = key.substr(mid + 1);
         }
-        oss << "  (" << left << "|" << center << "|" << right << ") -> " << rule_bits[idx] << "\n";
+        oss << "  (" << left << "|" << center << "|" << right
+            << ") -> " << rule_bits[idx] << "\n";
     }
     return oss.str();
 }
@@ -79,10 +88,13 @@ static std::string fmt_perm(const std::array<int,8>& perm) {
     return oss.str();
 }
 
-static bool verify_involution_over_tapes(int r, int L, int neighborhood_len, const std::vector<char>& rule_bits, const std::array<int,8>& perm, std::ostream& logf) {
+static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
+                                         const std::vector<char>& rule_bits,
+                                         const std::array<int,8>& perm,
+                                         std::ostream& logf) {
     if (L <= 0 || L >= 63) return false;
     unsigned long long words = 1ULL << L;
-    size_t ti = 0;
+    std::size_t ti = 0;
     for (unsigned long long mask = 0; mask < words; ++mask) {
         std::string w(L, '0');
         for (int i = 0; i < L; ++i) {
@@ -95,15 +107,20 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len, con
                 std::string w1;
                 int pos1;
                 std::string q1;
-                if (!apply_H_TMT(w, pos, q, r, neighborhood_len, rule_bits, perm, w1, pos1, q1)) {
-                    logf << "x#" << ti << " H indefinida | x=(" << w << "; head=" << pos << "; state=" << q << ")\n";
+                if (!apply_H_TMT(w, pos, q, r, neighborhood_len,
+                                  rule_bits, perm, w1, pos1, q1)) {
+                    logf << "x#" << ti << " H indefinida | x=("
+                         << w << "; head=" << pos << "; state=" << q << ")\n";
                     return false;
                 }
                 std::string w2;
                 int pos2;
                 std::string q2;
-                if (!apply_H_TMT(w1, pos1, q1, r, neighborhood_len, rule_bits, perm, w2, pos2, q2)) {
-                    logf << "x#" << ti << " H∘H indefinida | x=(" << w << "; head=" << pos << "; state=" << q << ") | Hx=(" << w1 << "; " << pos1 << "; " << q1 << ")\n";
+                if (!apply_H_TMT(w1, pos1, q1, r, neighborhood_len,
+                                  rule_bits, perm, w2, pos2, q2)) {
+                    logf << "x#" << ti << " H∘H indefinida | x=("
+                         << w << "; head=" << pos << "; state=" << q
+                         << ") | Hx=(" << w1 << "; " << pos1 << "; " << q1 << ")\n";
                     return false;
                 }
                 if (!(w2 == w && pos2 == pos && q2 == q)) {
@@ -114,7 +131,10 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len, con
                     return false;
                 }
                 if (ti < 10) {
-                    logf << "x#" << ti << " ok H∘H | x=(" << w << ";" << pos << ";" << q << ") | Hx=(" << w1 << ";" << pos1 << ";" << q1 << ") | HHx=(" << w2 << ";" << pos2 << ";" << q2 << ")\n";
+                    logf << "x#" << ti << " ok H∘H | x=("
+                         << w << ";" << pos << ";" << q
+                         << ") | Hx=(" << w1 << ";" << pos1 << ";" << q1
+                         << ") | HHx=(" << w2 << ";" << pos2 << ";" << q2 << ")\n";
                 }
                 ++ti;
             }
@@ -123,10 +143,13 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len, con
     return true;
 }
 
-static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len, const std::vector<char>& rule_bits, const std::array<int,8>& perm, std::ostream& logf) {
+static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len,
+                                        const std::vector<char>& rule_bits,
+                                        const std::array<int,8>& perm,
+                                        std::ostream& logf) {
     if (L <= 0 || L >= 63) return false;
     unsigned long long words = 1ULL << L;
-    size_t ti = 0;
+    std::size_t ti = 0;
     for (unsigned long long mask = 0; mask < words; ++mask) {
         std::string w(L, '0');
         for (int i = 0; i < L; ++i) {
@@ -139,7 +162,8 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len, cons
                 std::string wH;
                 int posH;
                 std::string qH;
-                if (!apply_H_TMT(w, pos, q, r, neighborhood_len, rule_bits, perm, wH, posH, qH)) {
+                if (!apply_H_TMT(w, pos, q, r, neighborhood_len,
+                                  rule_bits, perm, wH, posH, qH)) {
                     logf << "x#" << ti << " H indefinida\n";
                     return false;
                 }
@@ -149,12 +173,13 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len, cons
                     return false;
                 }
                 std::string wTH = resT.word_out;
-                int posTH = resT.pos_out;
+                int         posTH = (int)resT.pos_out;
                 std::string qTH = resT.state_out;
                 std::string wHTH;
                 int posHTH;
                 std::string qHTH;
-                if (!apply_H_TMT(wTH, posTH, qTH, r, neighborhood_len, rule_bits, perm, wHTH, posHTH, qHTH)) {
+                if (!apply_H_TMT(wTH, posTH, qTH, r, neighborhood_len,
+                                  rule_bits, perm, wHTH, posHTH, qHTH)) {
                     logf << "x#" << ti << " H en T(H(x)) indefinida\n";
                     return false;
                 }
@@ -164,7 +189,7 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len, cons
                     return false;
                 }
                 std::string wInv = resInv.word_out;
-                int posInv = resInv.pos_out;
+                int         posInv = (int)resInv.pos_out;
                 std::string qInv = resInv.state_out;
                 if (!(wHTH == wInv && posHTH == posInv && qHTH == qInv)) {
                     logf << "x#" << ti << " no cumple T^-1 = H∘T∘H\n";
@@ -176,7 +201,8 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len, cons
                     return false;
                 }
                 if (ti < 10) {
-                    logf << "x#" << ti << " ok formula | x=(" << w << ";" << pos << ";" << q << ")\n";
+                    logf << "x#" << ti << " ok formula | x=("
+                         << w << ";" << pos << ";" << q << ")\n";
                 }
                 ++ti;
             }
@@ -185,7 +211,11 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len, cons
     return true;
 }
 
-static void involutive_permutations_dfs(int n, std::vector<bool>& used, std::array<int,8>& p, int i, std::vector<std::array<int,8>>& out) {
+static void involutive_permutations_dfs(int n,
+                                        std::vector<bool>& used,
+                                        std::array<int,8>& p,
+                                        int i,
+                                        std::vector<std::array<int,8>>& out) {
     while (i < n && used[i]) ++i;
     if (i == n) {
         out.push_back(p);
@@ -256,7 +286,7 @@ static void for_each_combination(int n, int k, F f) {
 
 int main(int argc, char** argv) {
     std::string logdir = "logs_tmt";
-    long long progress_interval = 100000;
+    long long progress_interval = 100000;  // también usado como intervalo de log
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--logdir" && i + 1 < argc) {
@@ -265,21 +295,27 @@ int main(int argc, char** argv) {
             progress_interval = std::stoll(argv[++i]);
         }
     }
+
     std::filesystem::create_directories(logdir);
     long long inv_count = count_involutive_perms_8();
     std::vector<std::array<int,8>> perms = generate_involutive_permutations_8();
+
     std::atomic<bool> found(false);
     std::string found_path;
     int found_r = -1;
     std::mutex io_mutex;
+
     int r = 1;
     while (true) {
         int d = 2 * r;
         int L = 2 * d + 1;
-        std::filesystem::path rdir = std::filesystem::path(logdir) / ("r" + std::to_string(r));
+        std::filesystem::path rdir =
+            std::filesystem::path(logdir) / ("r" + std::to_string(r));
         std::filesystem::create_directories(rdir);
+
         int K = 2 * r + 1;
         int S = 1 << K;
+
         long double num_sym_bal = 0.0L;
         if (S % 2 == 0) {
             int half = S / 2;
@@ -291,72 +327,142 @@ int main(int argc, char** argv) {
             num_sym_bal = c;
         }
         long double total_H = num_sym_bal * static_cast<long double>(inv_count);
+
         {
             std::lock_guard<std::mutex> lock(io_mutex);
-            std::cout << "Iniciando r=" << r << ", L=" << L << ", H_balanceadas_max=" << static_cast<long double>(total_H) << "\n";
+            std::cout << "Iniciando r=" << r
+                      << ", L=" << L
+                      << ", H_balanceadas_max=" << static_cast<long double>(total_H)
+                      << "\n";
             std::cout.flush();
         }
+
         std::atomic<long long> tested(0);
         long long sym_rule_idx = 0;
         int half = S / 2;
+
         for_each_combination(S, half, [&](const std::vector<int>& ones) {
             if (found.load()) return;
+
             std::vector<char> rule_bits(S, '0');
             for (int idx : ones) rule_bits[idx] = '1';
+
             long long base_idx = sym_rule_idx * inv_count;
             sym_rule_idx++;
-            std::atomic<size_t> next_perm(0);
+
+            std::atomic<std::size_t> next_perm(0);
             unsigned int thread_count = std::thread::hardware_concurrency();
             if (thread_count == 0) thread_count = 1;
             std::vector<std::thread> threads;
             threads.reserve(thread_count);
+
             for (unsigned int t = 0; t < thread_count; ++t) {
                 threads.emplace_back([&, base_idx]() {
                     int neighborhood_len = K;
+                    NullBuffer nbuf;
+                    std::ostream devnull(&nbuf);
+
                     while (true) {
                         if (found.load()) return;
-                        size_t p_idx = next_perm.fetch_add(1);
+
+                        std::size_t p_idx = next_perm.fetch_add(1);
                         if (p_idx >= perms.size()) return;
+
                         long long h_idx = base_idx + static_cast<long long>(p_idx) + 1;
                         long long tnum = tested.fetch_add(1) + 1;
+
                         if (progress_interval > 0 && tnum % progress_interval == 0) {
                             std::lock_guard<std::mutex> lock(io_mutex);
-                            std::cout << "r=" << r << " progreso: " << tnum << " de " << static_cast<long double>(total_H) << "\n";
+                            std::cout << "r=" << r << " progreso: "
+                                      << tnum << " de "
+                                      << static_cast<long double>(total_H) << "\n";
                             std::cout.flush();
                         }
-                        std::filesystem::path fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                        std::ofstream f(fpath);
-                        if (!f) continue;
-                        f << fmt_rule_bits_table(rule_bits, r, neighborhood_len) << "\n";
-                        f << fmt_perm(perms[p_idx]) << "\n";
-                        if (!verify_involution_over_tapes(r, L, neighborhood_len, rule_bits, perms[p_idx], f)) {
+
+                        bool log_this =
+                            (progress_interval > 0 && (tnum % progress_interval == 0));
+
+                        std::filesystem::path fpath;
+                        std::ofstream f;
+                        std::ostream* logp = &devnull;
+
+                        if (log_this) {
+                            fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
+                            f.open(fpath);
+                            if (f) {
+                                f << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                  << "\n";
+                                f << fmt_perm(perms[p_idx]) << "\n";
+                                logp = &f;
+                            } else {
+                                log_this = false;
+                                logp = &devnull;
+                            }
+                        }
+
+                        if (!verify_involution_over_tapes(r, L, neighborhood_len,
+                                                          rule_bits, perms[p_idx],
+                                                          *logp)) {
                             continue;
                         }
-                        bool ok = verify_conjugacy_over_tapes(r, L, neighborhood_len, rule_bits, perms[p_idx], f);
-                        if (ok) {
-                            bool expected = false;
-                            if (found.compare_exchange_strong(expected, true)) {
+
+                        bool ok = verify_conjugacy_over_tapes(r, L, neighborhood_len,
+                                                              rule_bits, perms[p_idx],
+                                                              *logp);
+                        if (!ok) continue;
+
+                        bool expected = false;
+                        if (found.compare_exchange_strong(expected, true)) {
+                            // Este hilo es el primero que encuentra un H válido.
+                            if (!log_this) {
+                                fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
+                                std::ofstream fout(fpath);
+                                if (fout) {
+                                    fout << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                         << "\n";
+                                    fout << fmt_perm(perms[p_idx]) << "\n";
+                                    verify_involution_over_tapes(r, L, neighborhood_len,
+                                                                 rule_bits, perms[p_idx],
+                                                                 fout);
+                                    verify_conjugacy_over_tapes(r, L, neighborhood_len,
+                                                                rule_bits, perms[p_idx],
+                                                                fout);
+                                    fout << "ENCONTRADA\n";
+                                    fout.flush();
+                                }
+                            } else {
                                 f << "ENCONTRADA\n";
                                 f.flush();
+                            }
+
+                            {
                                 std::lock_guard<std::mutex> lock(io_mutex);
                                 found_path = fpath.string();
                                 found_r = r;
-                                std::cout << "H encontrada en r=" << r << ", archivo=" << found_path << "\n";
+                                std::cout << "H encontrada en r=" << r
+                                          << ", archivo=" << found_path << "\n";
                                 std::cout.flush();
                             }
                         }
+
+                        return;  // este hilo ya no necesita seguir
                     }
                 });
             }
+
             for (auto& th : threads) th.join();
         });
+
         if (found.load()) break;
+
         {
             std::lock_guard<std::mutex> lock(io_mutex);
             std::cout << "Terminado r=" << r << " sin encontrar H\n";
             std::cout.flush();
         }
+
         r += 1;
     }
+
     return 0;
 }
