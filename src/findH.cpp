@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <fstream>
+#include <array>
 #include <streambuf>
 
 struct NullBuffer : public std::streambuf {
@@ -88,13 +89,22 @@ static std::string fmt_perm(const std::array<int,8>& perm) {
     return oss.str();
 }
 
+// H∘H: muestreo uniforme de ejemplos “ok” sobre todo el espacio de (w,pos,q)
 static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
                                          const std::vector<char>& rule_bits,
                                          const std::array<int,8>& perm,
                                          std::ostream& logf) {
     if (L <= 0 || L >= 63) return false;
     unsigned long long words = 1ULL << L;
-    std::size_t ti = 0;
+    unsigned long long total_x = words * (unsigned long long)L * 8ULL;
+
+    const std::size_t MAX_OK_LOG_INV = 100;  // nº máximo de ejemplos “ok H∘H” por H
+    unsigned long long stride = (MAX_OK_LOG_INV > 0 && total_x > MAX_OK_LOG_INV)
+                              ? (total_x / MAX_OK_LOG_INV)
+                              : 1ULL;
+    std::size_t ok_logged = 0;
+
+    unsigned long long ti = 0;  // índice global de configuración
     for (unsigned long long mask = 0; mask < words; ++mask) {
         std::string w(L, '0');
         for (int i = 0; i < L; ++i) {
@@ -130,12 +140,16 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
                     logf << "HHx  = (" << w2 << "; head=" << pos2 << "; state=" << q2 << ")\n";
                     return false;
                 }
-                if (ti < 10) {
+
+                // Solo muestreo de algunos “ok”
+                if (ok_logged < MAX_OK_LOG_INV && (ti % stride == 0)) {
                     logf << "x#" << ti << " ok H∘H | x=("
                          << w << ";" << pos << ";" << q
                          << ") | Hx=(" << w1 << ";" << pos1 << ";" << q1
                          << ") | HHx=(" << w2 << ";" << pos2 << ";" << q2 << ")\n";
+                    ++ok_logged;
                 }
+
                 ++ti;
             }
         }
@@ -143,13 +157,24 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
     return true;
 }
 
-static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len,
-                                        const std::vector<char>& rule_bits,
-                                        const std::array<int,8>& perm,
-                                        std::ostream& logf) {
+// Fórmula T^{-1} = H∘T∘H, ya con muestreo uniforme de “ok formula”
+static bool verify_conjugacy_over_tapes(
+    int r, int L, int neighborhood_len,
+    const std::vector<char>& rule_bits,
+    const std::array<int,8>& perm,
+    std::ostream& logf
+) {
     if (L <= 0 || L >= 63) return false;
     unsigned long long words = 1ULL << L;
-    std::size_t ti = 0;
+    unsigned long long total_x = words * (unsigned long long)L * 8ULL;
+
+    const std::size_t MAX_OK_LOG = 64;  // nº máximo de ejemplos “ok formula” por H
+    unsigned long long stride = (MAX_OK_LOG > 0 && total_x > MAX_OK_LOG)
+                              ? (total_x / MAX_OK_LOG)
+                              : 1ULL;
+    std::size_t ok_logged = 0;
+
+    unsigned long long ti = 0;
     for (unsigned long long mask = 0; mask < words; ++mask) {
         std::string w(L, '0');
         for (int i = 0; i < L; ++i) {
@@ -159,14 +184,14 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len,
         for (int pos = 0; pos < L; ++pos) {
             for (int qi = 0; qi < 8; ++qi) {
                 const std::string& q = STATE_LABELS[qi];
-                std::string wH;
-                int posH;
-                std::string qH;
+
+                std::string wH; int posH; std::string qH;
                 if (!apply_H_TMT(w, pos, q, r, neighborhood_len,
                                   rule_bits, perm, wH, posH, qH)) {
                     logf << "x#" << ti << " H indefinida\n";
                     return false;
                 }
+
                 RunResult resT = run_original(1, wH, posH, qH);
                 if (!resT.ok) {
                     logf << "x#" << ti << " T fallo\n";
@@ -175,14 +200,14 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len,
                 std::string wTH = resT.word_out;
                 int         posTH = (int)resT.pos_out;
                 std::string qTH = resT.state_out;
-                std::string wHTH;
-                int posHTH;
-                std::string qHTH;
+
+                std::string wHTH; int posHTH; std::string qHTH;
                 if (!apply_H_TMT(wTH, posTH, qTH, r, neighborhood_len,
                                   rule_bits, perm, wHTH, posHTH, qHTH)) {
                     logf << "x#" << ti << " H en T(H(x)) indefinida\n";
                     return false;
                 }
+
                 RunResult resInv = run_inversa(1, w, pos, q);
                 if (!resInv.ok) {
                     logf << "x#" << ti << " T^-1 fallo\n";
@@ -191,6 +216,7 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len,
                 std::string wInv = resInv.word_out;
                 int         posInv = (int)resInv.pos_out;
                 std::string qInv = resInv.state_out;
+
                 if (!(wHTH == wInv && posHTH == posInv && qHTH == qInv)) {
                     logf << "x#" << ti << " no cumple T^-1 = H∘T∘H\n";
                     logf << "x     = (" << w << ";" << pos << ";" << q << ")\n";
@@ -200,10 +226,13 @@ static bool verify_conjugacy_over_tapes(int r, int L, int neighborhood_len,
                     logf << "Tinvx = (" << wInv << ";" << posInv << ";" << qInv << ")\n";
                     return false;
                 }
-                if (ti < 10) {
+
+                if (ok_logged < MAX_OK_LOG && (ti % stride == 0)) {
                     logf << "x#" << ti << " ok formula | x=("
                          << w << ";" << pos << ";" << q << ")\n";
+                    ++ok_logged;
                 }
+
                 ++ti;
             }
         }
@@ -286,7 +315,7 @@ static void for_each_combination(int n, int k, F f) {
 
 int main(int argc, char** argv) {
     std::string logdir = "logs_tmt";
-    long long progress_interval = 100000;  // también usado como intervalo de log
+    long long progress_interval = 100000;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--logdir" && i + 1 < argc) {
@@ -312,6 +341,8 @@ int main(int argc, char** argv) {
         std::filesystem::path rdir =
             std::filesystem::path(logdir) / ("r" + std::to_string(r));
         std::filesystem::create_directories(rdir);
+        std::filesystem::path formula_rdir = rdir / "formula";
+        std::filesystem::create_directories(formula_rdir);
 
         int K = 2 * r + 1;
         int S = 1 << K;
@@ -379,65 +410,125 @@ int main(int argc, char** argv) {
                             std::cout.flush();
                         }
 
-                        bool log_this =
-                            (progress_interval > 0 && (tnum % progress_interval == 0));
+                        bool log_main = (progress_interval > 0 &&
+                                         (tnum % progress_interval == 0));
 
-                        std::filesystem::path fpath;
-                        std::ofstream f;
-                        std::ostream* logp = &devnull;
+                        std::filesystem::path main_fpath;
+                        std::ofstream main_log;
+                        std::ostream* main_logp = &devnull;
 
-                        if (log_this) {
-                            fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                            f.open(fpath);
-                            if (f) {
-                                f << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                  << "\n";
-                                f << fmt_perm(perms[p_idx]) << "\n";
-                                logp = &f;
+                        if (log_main) {
+                            main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
+                            main_log.open(main_fpath);
+                            if (main_log) {
+                                main_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                         << "\n";
+                                main_log << fmt_perm(perms[p_idx]) << "\n";
+                                main_logp = &main_log;
                             } else {
-                                log_this = false;
-                                logp = &devnull;
+                                log_main = false;
+                                main_logp = &devnull;
                             }
                         }
 
-                        if (!verify_involution_over_tapes(r, L, neighborhood_len,
-                                                          rule_bits, perms[p_idx],
-                                                          *logp)) {
+                        bool invol_ok = verify_involution_over_tapes(
+                            r, L, neighborhood_len, rule_bits, perms[p_idx],
+                            *main_logp
+                        );
+                        if (!invol_ok) {
                             continue;
                         }
 
-                        bool ok = verify_conjugacy_over_tapes(r, L, neighborhood_len,
-                                                              rule_bits, perms[p_idx],
-                                                              *logp);
-                        if (!ok) continue;
+                        // Llegó al punto de intentar la fórmula: crear log en formula_rdir
+                        std::filesystem::path formula_fpath =
+                            formula_rdir / ("H_" + std::to_string(h_idx) + ".log");
+                        std::ofstream formula_log(formula_fpath);
+                        if (!formula_log) {
+                            // Si no se puede abrir, igual intentamos sin log
+                            NullBuffer nbuf2;
+                            std::ostream devnull2(&nbuf2);
+                            bool inv2 = verify_involution_over_tapes(
+                                r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                devnull2
+                            );
+                            if (!inv2) continue;
+                            bool conj2 = verify_conjugacy_over_tapes(
+                                r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                devnull2
+                            );
+                            if (conj2) {
+                                bool expected = false;
+                                if (found.compare_exchange_strong(expected, true)) {
+                                    std::lock_guard<std::mutex> lock(io_mutex);
+                                    found_path = formula_fpath.string();
+                                    found_r = r;
+                                    std::cout << "H encontrada en r=" << r
+                                              << ", pero no se pudo escribir log\n";
+                                    std::cout.flush();
+                                }
+                            }
+                            return;
+                        }
 
+                        // Encabezado en log de fórmula
+                        formula_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                    << "\n";
+                        formula_log << fmt_perm(perms[p_idx]) << "\n";
+
+                        bool invol_ok2 = verify_involution_over_tapes(
+                            r, L, neighborhood_len, rule_bits, perms[p_idx],
+                            formula_log
+                        );
+                        if (!invol_ok2) {
+                            // No debería, pero si pasa dejamos el log y seguimos
+                            continue;
+                        }
+
+                        bool conj_ok = verify_conjugacy_over_tapes(
+                            r, L, neighborhood_len, rule_bits, perms[p_idx],
+                            formula_log
+                        );
+
+                        if (!conj_ok) {
+                            // No cumple la fórmula; el log queda en formula_rdir
+                            continue;
+                        }
+
+                        // H encontrada: marcar y asegurar logs completos
                         bool expected = false;
                         if (found.compare_exchange_strong(expected, true)) {
-                            // Este hilo es el primero que encuentra un H válido.
-                            if (!log_this) {
-                                fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                                std::ofstream fout(fpath);
-                                if (fout) {
-                                    fout << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                         << "\n";
-                                    fout << fmt_perm(perms[p_idx]) << "\n";
-                                    verify_involution_over_tapes(r, L, neighborhood_len,
-                                                                 rule_bits, perms[p_idx],
-                                                                 fout);
-                                    verify_conjugacy_over_tapes(r, L, neighborhood_len,
-                                                                rule_bits, perms[p_idx],
-                                                                fout);
-                                    fout << "ENCONTRADA\n";
-                                    fout.flush();
+                            formula_log << "ENCONTRADA\n";
+                            formula_log.flush();
+
+                            // Si no había log principal para este H, crearlo ahora
+                            if (!log_main) {
+                                main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
+                                std::ofstream mf(main_fpath);
+                                if (mf) {
+                                    mf << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                       << "\n";
+                                    mf << fmt_perm(perms[p_idx]) << "\n";
+                                    verify_involution_over_tapes(
+                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                        mf
+                                    );
+                                    verify_conjugacy_over_tapes(
+                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                        mf
+                                    );
+                                    mf << "ENCONTRADA\n";
+                                    mf.flush();
                                 }
                             } else {
-                                f << "ENCONTRADA\n";
-                                f.flush();
+                                if (main_log) {
+                                    main_log << "ENCONTRADA\n";
+                                    main_log.flush();
+                                }
                             }
 
                             {
                                 std::lock_guard<std::mutex> lock(io_mutex);
-                                found_path = fpath.string();
+                                found_path = formula_fpath.string();
                                 found_r = r;
                                 std::cout << "H encontrada en r=" << r
                                           << ", archivo=" << found_path << "\n";
@@ -445,7 +536,7 @@ int main(int argc, char** argv) {
                             }
                         }
 
-                        return;  // este hilo ya no necesita seguir
+                        return;  // este hilo ya no necesita seguir procesando más perms
                     }
                 });
             }
