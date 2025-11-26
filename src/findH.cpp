@@ -332,7 +332,8 @@ static void for_each_combination(int n, int k, F f) {
 int main(int argc, char** argv) {
     std::string logdir = "logs_tmt";
     long long progress_interval = 100000;
-    unsigned int requested_threads = 0; // 0 => usar hardware_concurrency
+    unsigned int requested_threads = 0;    // 0 => usar hardware_concurrency
+    long long chunk_size = 10000;          // nº de H por bloque por hilo
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -342,8 +343,11 @@ int main(int argc, char** argv) {
             progress_interval = std::stoll(argv[++i]);
         } else if (arg == "--threads" && i + 1 < argc) {
             requested_threads = static_cast<unsigned int>(std::stoul(argv[++i]));
+        } else if (arg == "--chunk-size" && i + 1 < argc) {
+            chunk_size = std::stoll(argv[++i]);
         }
     }
+    if (chunk_size < 1) chunk_size = 1;
 
     std::filesystem::create_directories(logdir);
     long long inv_count = count_involutive_perms_8();
@@ -360,6 +364,7 @@ int main(int argc, char** argv) {
         std::cout << "hardware_concurrency=" << hw << "\n";
         if (requested_threads > 0)
             std::cout << "threads solicitados=" << requested_threads << "\n";
+        std::cout << "chunk_size=" << chunk_size << "\n";
         std::cout.flush();
     }
 
@@ -418,6 +423,8 @@ int main(int argc, char** argv) {
             if (thread_count > perms.size())
                 thread_count = static_cast<unsigned int>(perms.size());
 
+            std::atomic<long long> next_perm_chunk(0);
+
             std::vector<std::thread> threads;
             threads.reserve(thread_count);
 
@@ -427,191 +434,208 @@ int main(int argc, char** argv) {
                     NullBuffer nbuf;
                     std::ostream devnull(&nbuf);
 
+                    bool is_logger_thread = (t == 0);
+
                     std::size_t nperms = perms.size();
-                    std::size_t start = (nperms * t) / thread_count;
-                    std::size_t end   = (nperms * (t + 1)) / thread_count;
 
-                    for (std::size_t p_idx = start; p_idx < end; ++p_idx) {
-                        if (found.load()) return;
+                    while (!found.load()) {
+                        long long start_ll = next_perm_chunk.fetch_add(chunk_size);
+                        if (start_ll >= (long long)nperms) break;
+                        long long end_ll = start_ll + chunk_size;
+                        if (end_ll > (long long)nperms) end_ll = (long long)nperms;
 
-                        long long h_idx = base_idx + static_cast<long long>(p_idx) + 1;
-                        long long tnum = tested.fetch_add(1) + 1;
+                        for (long long p_idx_ll = start_ll;
+                             p_idx_ll < end_ll && !found.load();
+                             ++p_idx_ll) {
 
-                        if (progress_interval > 0 && tnum % progress_interval == 0) {
-                            std::lock_guard<std::mutex> lock(io_mutex);
-                            std::cout << "r=" << r << " progreso: "
-                                      << tnum << " de "
-                                      << static_cast<long double>(total_H) << "\n";
-                            std::cout.flush();
-                        }
+                            std::size_t p_idx = static_cast<std::size_t>(p_idx_ll);
+                            long long h_idx = base_idx + p_idx_ll + 1;
 
-                        bool log_main = (progress_interval > 0 &&
-                                         (tnum % progress_interval == 0));
+                            long long tnum = tested.fetch_add(1) + 1;
 
-                        std::filesystem::path main_fpath;
-                        std::ofstream main_log;
-                        std::ostream* main_logp = &devnull;
-
-                        if (log_main) {
-                            main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                            main_log.open(main_fpath);
-                            if (main_log) {
-                                main_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                         << "\n";
-                                main_log << fmt_perm(perms[p_idx]) << "\n";
-                                main_logp = &main_log;
-                            } else {
-                                log_main = false;
-                                main_logp = &devnull;
+                            bool do_progress = false;
+                            if (is_logger_thread && progress_interval > 0 &&
+                                (tnum % progress_interval == 0)) {
+                                do_progress = true;
                             }
-                        }
 
-                        bool invol_ok = verify_involution_over_tapes(
-                            r, L, neighborhood_len, rule_bits, perms[p_idx],
-                            *main_logp
-                        );
-                        if (!invol_ok) {
-                            continue;
-                        }
+                            if (do_progress) {
+                                std::lock_guard<std::mutex> lock(io_mutex);
+                                std::cout << "r=" << r << " progreso: "
+                                          << tnum << " de "
+                                          << static_cast<long double>(total_H) << "\n";
+                                std::cout.flush();
+                            }
 
-                        // Llegó al punto de intentar la fórmula:
-                        // log temporal en formula_rdir, luego se reclasifica si pasa >=75%
-                        std::filesystem::path tmp_fpath =
-                            formula_rdir / ("H_" + std::to_string(h_idx) + ".log.tmp");
-                        std::ofstream formula_log(tmp_fpath);
-                        if (!formula_log) {
-                            // No se pudo abrir log de fórmula, pero igual probamos sin log
-                            NullBuffer nbuf2;
-                            std::ostream devnull2(&nbuf2);
-                            bool inv2 = verify_involution_over_tapes(
+                            // Solo el hilo logger escribe log principal periódico
+                            bool log_main = do_progress;
+
+                            std::filesystem::path main_fpath;
+                            std::ofstream main_log;
+                            std::ostream* main_logp = &devnull;
+
+                            if (log_main) {
+                                main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
+                                main_log.open(main_fpath);
+                                if (main_log) {
+                                    main_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                             << "\n";
+                                    main_log << fmt_perm(perms[p_idx]) << "\n";
+                                    main_logp = &main_log;
+                                } else {
+                                    log_main = false;
+                                    main_logp = &devnull;
+                                }
+                            }
+
+                            bool invol_ok = verify_involution_over_tapes(
                                 r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                devnull2
+                                *main_logp
                             );
-                            if (!inv2) continue;
-                            ConjugacyResult cr2 = verify_conjugacy_over_tapes(
+                            if (!invol_ok) {
+                                continue;
+                            }
+
+                            // Llegó al punto de intentar la fórmula:
+                            // log temporal en formula_rdir, luego se reclasifica si pasa >=75%
+                            std::filesystem::path tmp_fpath =
+                                formula_rdir / ("H_" + std::to_string(h_idx) + ".log.tmp");
+                            std::ofstream formula_log(tmp_fpath);
+                            if (!formula_log) {
+                                // No se pudo abrir log de fórmula, pero igual probamos sin log
+                                NullBuffer nbuf2;
+                                std::ostream devnull2(&nbuf2);
+                                bool inv2 = verify_involution_over_tapes(
+                                    r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                    devnull2
+                                );
+                                if (!inv2) continue;
+                                ConjugacyResult cr2 = verify_conjugacy_over_tapes(
+                                    r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                    devnull2
+                                );
+                                if (cr2.full_ok) {
+                                    bool expected = false;
+                                    if (found.compare_exchange_strong(expected, true)) {
+                                        std::lock_guard<std::mutex> lock(io_mutex);
+                                        found_path = tmp_fpath.string();
+                                        found_r = r;
+                                        std::cout << "H encontrada en r=" << r
+                                                  << ", pero no se pudo escribir log\n";
+                                        std::cout.flush();
+                                    }
+                                }
+                                return;
+                            }
+
+                            // Encabezado en log de fórmula
+                            formula_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                        << "\n";
+                            formula_log << fmt_perm(perms[p_idx]) << "\n";
+
+                            bool invol_ok2 = verify_involution_over_tapes(
                                 r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                devnull2
+                                formula_log
                             );
-                            if (cr2.full_ok) {
-                                bool expected = false;
-                                if (found.compare_exchange_strong(expected, true)) {
+                            if (!invol_ok2) {
+                                formula_log.flush();
+                                formula_log.close();
+                                std::error_code ec_rm;
+                                std::filesystem::remove(tmp_fpath, ec_rm);
+                                continue;
+                            }
+
+                            ConjugacyResult cr = verify_conjugacy_over_tapes(
+                                r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                formula_log
+                            );
+
+                            formula_log.flush();
+                            formula_log.close();
+
+                            // Clasificación: solo guardamos si pasa >= 75% de las combinaciones
+                            long double ratio = 0.0L;
+                            if (cr.total > 0) {
+                                ratio = (long double)cr.succeeded / (long double)cr.total;
+                            }
+
+                            if (!cr.full_ok && ratio < 0.75L) {
+                                // Pasa menos del 75%: no nos interesa, borramos el log
+                                std::error_code ec_rm;
+                                std::filesystem::remove(tmp_fpath, ec_rm);
+                                continue;
+                            }
+
+                            // Aquí ratio >= 0.75 o full_ok
+                            std::filesystem::path target_dir = formula_rdir / "75";
+                            if (cr.full_ok) {
+                                target_dir /= "100";
+                            }
+
+                            std::error_code ec_mk;
+                            std::filesystem::create_directories(target_dir, ec_mk);
+
+                            std::filesystem::path formula_fpath =
+                                target_dir / ("H_" + std::to_string(h_idx) + ".log");
+
+                            std::error_code ec_mv;
+                            std::filesystem::rename(tmp_fpath, formula_fpath, ec_mv);
+
+                            if (!cr.full_ok) {
+                                // No cumple la fórmula al 100%; solo nos interesa para análisis,
+                                // pero no detenemos la búsqueda.
+                                continue;
+                            }
+
+                            // H cumple la fórmula en todas las configuraciones
+                            bool expected = false;
+                            if (found.compare_exchange_strong(expected, true)) {
+                                // Somos el primer hilo en encontrar un H válido
+                                if (!log_main) {
+                                    // No se había generado log principal, lo creamos ahora
+                                    main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
+                                    std::ofstream mf(main_fpath);
+                                    if (mf) {
+                                        mf << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                           << "\n";
+                                        mf << fmt_perm(perms[p_idx]) << "\n";
+                                        verify_involution_over_tapes(
+                                            r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                            mf
+                                        );
+                                        verify_conjugacy_over_tapes(
+                                            r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                            mf
+                                        );
+                                        mf << "ENCONTRADA\n";
+                                        mf.flush();
+                                    }
+                                } else {
+                                    if (main_log) {
+                                        main_log << "ENCONTRADA\n";
+                                        main_log.flush();
+                                    }
+                                }
+
+                                {
                                     std::lock_guard<std::mutex> lock(io_mutex);
-                                    found_path = tmp_fpath.string();
+                                    found_path = formula_fpath.string();
                                     found_r = r;
                                     std::cout << "H encontrada en r=" << r
-                                              << ", pero no se pudo escribir log\n";
+                                              << ", archivo=" << found_path << "\n";
                                     std::cout.flush();
                                 }
                             }
-                            return;
-                        }
 
-                        // Encabezado en log de fórmula
-                        formula_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                    << "\n";
-                        formula_log << fmt_perm(perms[p_idx]) << "\n";
-
-                        bool invol_ok2 = verify_involution_over_tapes(
-                            r, L, neighborhood_len, rule_bits, perms[p_idx],
-                            formula_log
-                        );
-                        if (!invol_ok2) {
-                            formula_log.flush();
-                            formula_log.close();
-                            std::error_code ec_rm;
-                            std::filesystem::remove(tmp_fpath, ec_rm);
-                            continue;
-                        }
-
-                        ConjugacyResult cr = verify_conjugacy_over_tapes(
-                            r, L, neighborhood_len, rule_bits, perms[p_idx],
-                            formula_log
-                        );
-
-                        formula_log.flush();
-                        formula_log.close();
-
-                        // Clasificación: solo guardamos si pasa >= 75% de las combinaciones
-                        long double ratio = 0.0L;
-                        if (cr.total > 0) {
-                            ratio = (long double)cr.succeeded / (long double)cr.total;
-                        }
-
-                        if (!cr.full_ok && ratio < 0.75L) {
-                            // Pasa menos del 75%: no nos interesa, borramos el log
-                            std::error_code ec_rm;
-                            std::filesystem::remove(tmp_fpath, ec_rm);
-                            continue;
-                        }
-
-                        // Aquí ratio >= 0.75 o full_ok
-                        std::filesystem::path target_dir = formula_rdir / "75";
-                        if (cr.full_ok) {
-                            target_dir /= "100";
-                        }
-
-                        std::error_code ec_mk;
-                        std::filesystem::create_directories(target_dir, ec_mk);
-
-                        std::filesystem::path formula_fpath =
-                            target_dir / ("H_" + std::to_string(h_idx) + ".log");
-
-                        std::error_code ec_mv;
-                        std::filesystem::rename(tmp_fpath, formula_fpath, ec_mv);
-
-                        if (!cr.full_ok) {
-                            // No cumple la fórmula al 100%; solo nos interesa para análisis,
-                            // pero no detenemos la búsqueda.
-                            continue;
-                        }
-
-                        // H cumple la fórmula en todas las configuraciones
-                        bool expected = false;
-                        if (found.compare_exchange_strong(expected, true)) {
-                            // Somos el primer hilo en encontrar un H válido
-                            if (!log_main) {
-                                // No se había generado log principal, lo creamos ahora
-                                main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                                std::ofstream mf(main_fpath);
-                                if (mf) {
-                                    mf << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                       << "\n";
-                                    mf << fmt_perm(perms[p_idx]) << "\n";
-                                    verify_involution_over_tapes(
-                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                        mf
-                                    );
-                                    verify_conjugacy_over_tapes(
-                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                        mf
-                                    );
-                                    mf << "ENCONTRADA\n";
-                                    mf.flush();
-                                }
-                            } else {
-                                if (main_log) {
-                                    main_log << "ENCONTRADA\n";
-                                    main_log.flush();
-                                }
-                            }
-
-                            {
-                                std::lock_guard<std::mutex> lock(io_mutex);
-                                found_path = formula_fpath.string();
-                                found_r = r;
-                                std::cout << "H encontrada en r=" << r
-                                          << ", archivo=" << found_path << "\n";
-                                std::cout.flush();
-                            }
-                        }
-
-                        return;  // este hilo ya no necesita seguir procesando más perms
-                    }
+                            return;  // este hilo ya no necesita seguir procesando más perms
+                        } // for p_idx_ll
+                    } // while bloques
                 });
             }
 
             for (auto& th : threads) th.join();
-        });
+
+        }); // for_each_combination
 
         if (found.load()) break;
 
