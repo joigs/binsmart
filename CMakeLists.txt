@@ -8,16 +8,14 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-find_package(Threads REQUIRED)
-
 add_library(tm STATIC src/tm.cpp)
 target_include_directories(tm PUBLIC src)
 
 add_executable(original src/original.cpp)
-target_link_libraries(original PRIVATE tm Threads::Threads)
+target_link_libraries(original PRIVATE tm)
 
 add_executable(inversa src/inversa.cpp)
-target_link_libraries(inversa PRIVATE tm Threads::Threads)
+target_link_libraries(inversa PRIVATE tm)
 
 add_executable(findH src/findH.cpp)
-target_link_libraries(findH PRIVATE tm Threads::Threads)
+target_link_libraries(findH PRIVATE tm)
