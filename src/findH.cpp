@@ -332,12 +332,17 @@ static void for_each_combination(int n, int k, F f) {
 int main(int argc, char** argv) {
     std::string logdir = "logs_tmt";
     long long progress_interval = 100000;
+    int requested_threads = 0;  // 0 => usar hardware_concurrency()
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--logdir" && i + 1 < argc) {
             logdir = argv[++i];
         } else if (arg == "--progress-interval" && i + 1 < argc) {
             progress_interval = std::stoll(argv[++i]);
+        } else if (arg == "--threads" && i + 1 < argc) {
+            requested_threads = std::stoi(argv[++i]);
+            if (requested_threads < 1) requested_threads = 1;
         }
     }
 
@@ -375,11 +380,21 @@ int main(int argc, char** argv) {
         }
         long double total_H = num_sym_bal * static_cast<long double>(inv_count);
 
+        // Nº de hilos efectivo
+        unsigned int base_thread_count;
+        if (requested_threads > 0) {
+            base_thread_count = (unsigned int)requested_threads;
+        } else {
+            base_thread_count = std::thread::hardware_concurrency();
+            if (base_thread_count == 0) base_thread_count = 1;
+        }
+
         {
             std::lock_guard<std::mutex> lock(io_mutex);
             std::cout << "Iniciando r=" << r
                       << ", L=" << L
                       << ", H_balanceadas_max=" << static_cast<long double>(total_H)
+                      << ", threads=" << base_thread_count
                       << "\n";
             std::cout.flush();
         }
@@ -398,12 +413,11 @@ int main(int argc, char** argv) {
             sym_rule_idx++;
 
             std::atomic<std::size_t> next_perm(0);
-            unsigned int thread_count = std::thread::hardware_concurrency();
-            if (thread_count == 0) thread_count = 1;
-            std::vector<std::thread> threads;
-            threads.reserve(thread_count);
 
-            for (unsigned int t = 0; t < thread_count; ++t) {
+            std::vector<std::thread> threads;
+            threads.reserve(base_thread_count);
+
+            for (unsigned int t = 0; t < base_thread_count; ++t) {
                 threads.emplace_back([&, base_idx]() {
                     int neighborhood_len = K;
                     NullBuffer nbuf;
