@@ -16,6 +16,12 @@ struct NullBuffer : public std::streambuf {
     int overflow(int c) override { return c; }
 };
 
+struct ConjugacyResult {
+    bool full_ok;                  // true si pasó todas las configuraciones
+    unsigned long long succeeded;  // cuántas configuraciones cumplieron la fórmula
+    unsigned long long total;      // total de configuraciones
+};
+
 static bool apply_symbol_CA(const std::string& word, int r, int neighborhood_len,
                             const std::vector<char>& rule_bits, std::string& out) {
     int L = static_cast<int>(word.size());
@@ -89,7 +95,7 @@ static std::string fmt_perm(const std::array<int,8>& perm) {
     return oss.str();
 }
 
-// H∘H: muestreo uniforme de ejemplos “ok” sobre todo el espacio de (w,pos,q)
+// H∘H: muestreo uniforme de ejemplos “ok H∘H” para no inflar el log
 static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
                                          const std::vector<char>& rule_bits,
                                          const std::array<int,8>& perm,
@@ -141,7 +147,6 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
                     return false;
                 }
 
-                // Solo muestreo de algunos “ok”
                 if (ok_logged < MAX_OK_LOG_INV && (ti % stride == 0)) {
                     logf << "x#" << ti << " ok H∘H | x=("
                          << w << ";" << pos << ";" << q
@@ -157,16 +162,23 @@ static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
     return true;
 }
 
-// Fórmula T^{-1} = H∘T∘H, ya con muestreo uniforme de “ok formula”
-static bool verify_conjugacy_over_tapes(
+// Fórmula T^{-1} = H∘T∘H, con muestreo + contadores para clasificación
+static ConjugacyResult verify_conjugacy_over_tapes(
     int r, int L, int neighborhood_len,
     const std::vector<char>& rule_bits,
     const std::array<int,8>& perm,
     std::ostream& logf
 ) {
-    if (L <= 0 || L >= 63) return false;
+    ConjugacyResult res;
+    res.full_ok   = false;
+    res.succeeded = 0;
+    res.total     = 0;
+
+    if (L <= 0 || L >= 63) return res;
+
     unsigned long long words = 1ULL << L;
     unsigned long long total_x = words * (unsigned long long)L * 8ULL;
+    res.total = total_x;
 
     const std::size_t MAX_OK_LOG = 64;  // nº máximo de ejemplos “ok formula” por H
     unsigned long long stride = (MAX_OK_LOG > 0 && total_x > MAX_OK_LOG)
@@ -189,33 +201,33 @@ static bool verify_conjugacy_over_tapes(
                 if (!apply_H_TMT(w, pos, q, r, neighborhood_len,
                                   rule_bits, perm, wH, posH, qH)) {
                     logf << "x#" << ti << " H indefinida\n";
-                    return false;
+                    return res;  // succeeded se mantiene
                 }
 
                 RunResult resT = run_original(1, wH, posH, qH);
                 if (!resT.ok) {
                     logf << "x#" << ti << " T fallo\n";
-                    return false;
+                    return res;
                 }
-                std::string wTH = resT.word_out;
+                std::string wTH  = resT.word_out;
                 int         posTH = (int)resT.pos_out;
-                std::string qTH = resT.state_out;
+                std::string qTH  = resT.state_out;
 
                 std::string wHTH; int posHTH; std::string qHTH;
                 if (!apply_H_TMT(wTH, posTH, qTH, r, neighborhood_len,
                                   rule_bits, perm, wHTH, posHTH, qHTH)) {
                     logf << "x#" << ti << " H en T(H(x)) indefinida\n";
-                    return false;
+                    return res;
                 }
 
                 RunResult resInv = run_inversa(1, w, pos, q);
                 if (!resInv.ok) {
                     logf << "x#" << ti << " T^-1 fallo\n";
-                    return false;
+                    return res;
                 }
-                std::string wInv = resInv.word_out;
+                std::string wInv  = resInv.word_out;
                 int         posInv = (int)resInv.pos_out;
-                std::string qInv = resInv.state_out;
+                std::string qInv  = resInv.state_out;
 
                 if (!(wHTH == wInv && posHTH == posInv && qHTH == qInv)) {
                     logf << "x#" << ti << " no cumple T^-1 = H∘T∘H\n";
@@ -224,8 +236,10 @@ static bool verify_conjugacy_over_tapes(
                     logf << "THx   = (" << wTH << ";" << posTH << ";" << qTH << ")\n";
                     logf << "HTHx  = (" << wHTH << ";" << posHTH << ";" << qHTH << ")\n";
                     logf << "Tinvx = (" << wInv << ";" << posInv << ";" << qInv << ")\n";
-                    return false;
+                    return res;
                 }
+
+                ++res.succeeded;
 
                 if (ok_logged < MAX_OK_LOG && (ti % stride == 0)) {
                     logf << "x#" << ti << " ok formula | x=("
@@ -237,7 +251,9 @@ static bool verify_conjugacy_over_tapes(
             }
         }
     }
-    return true;
+
+    res.full_ok = true;
+    return res;
 }
 
 static void involutive_permutations_dfs(int n,
@@ -439,12 +455,13 @@ int main(int argc, char** argv) {
                             continue;
                         }
 
-                        // Llegó al punto de intentar la fórmula: crear log en formula_rdir
-                        std::filesystem::path formula_fpath =
-                            formula_rdir / ("H_" + std::to_string(h_idx) + ".log");
-                        std::ofstream formula_log(formula_fpath);
+                        // Llegó al punto de intentar la fórmula:
+                        // log temporal en formula_rdir, luego se reclasifica si pasa >=75%
+                        std::filesystem::path tmp_fpath =
+                            formula_rdir / ("H_" + std::to_string(h_idx) + ".log.tmp");
+                        std::ofstream formula_log(tmp_fpath);
                         if (!formula_log) {
-                            // Si no se puede abrir, igual intentamos sin log
+                            // No se pudo abrir log de fórmula, pero igual probamos sin log
                             NullBuffer nbuf2;
                             std::ostream devnull2(&nbuf2);
                             bool inv2 = verify_involution_over_tapes(
@@ -452,15 +469,15 @@ int main(int argc, char** argv) {
                                 devnull2
                             );
                             if (!inv2) continue;
-                            bool conj2 = verify_conjugacy_over_tapes(
+                            ConjugacyResult cr2 = verify_conjugacy_over_tapes(
                                 r, L, neighborhood_len, rule_bits, perms[p_idx],
                                 devnull2
                             );
-                            if (conj2) {
+                            if (cr2.full_ok) {
                                 bool expected = false;
                                 if (found.compare_exchange_strong(expected, true)) {
                                     std::lock_guard<std::mutex> lock(io_mutex);
-                                    found_path = formula_fpath.string();
+                                    found_path = tmp_fpath.string();
                                     found_r = r;
                                     std::cout << "H encontrada en r=" << r
                                               << ", pero no se pudo escribir log\n";
@@ -480,28 +497,64 @@ int main(int argc, char** argv) {
                             formula_log
                         );
                         if (!invol_ok2) {
-                            // No debería, pero si pasa dejamos el log y seguimos
+                            formula_log.flush();
+                            formula_log.close();
+                            std::error_code ec_rm;
+                            std::filesystem::remove(tmp_fpath, ec_rm);
                             continue;
                         }
 
-                        bool conj_ok = verify_conjugacy_over_tapes(
+                        ConjugacyResult cr = verify_conjugacy_over_tapes(
                             r, L, neighborhood_len, rule_bits, perms[p_idx],
                             formula_log
                         );
 
-                        if (!conj_ok) {
-                            // No cumple la fórmula; el log queda en formula_rdir
+                        formula_log.flush();
+                        formula_log.close();
+
+                        // Clasificación: solo guardamos si pasa >= 75% de las combinaciones
+                        long double ratio = 0.0L;
+                        if (cr.total > 0) {
+                            ratio = (long double)cr.succeeded / (long double)cr.total;
+                        }
+
+                        if (!cr.full_ok && ratio < 0.75L) {
+                            // Pasa menos del 75%: no nos interesa, borramos el log
+                            std::error_code ec_rm;
+                            std::filesystem::remove(tmp_fpath, ec_rm);
                             continue;
                         }
 
-                        // H encontrada: marcar y asegurar logs completos
+                        // Aquí ratio >= 0.75 o full_ok
+                        std::filesystem::path target_dir = formula_rdir / "75";
+                        if (cr.full_ok) {
+                            target_dir /= "100";
+                        }
+
+                        std::error_code ec_mk;
+                        std::filesystem::create_directories(target_dir, ec_mk);
+
+                        std::filesystem::path formula_fpath =
+                            target_dir / ("H_" + std::to_string(h_idx) + ".log");
+
+                        std::error_code ec_mv;
+                        std::filesystem::rename(tmp_fpath, formula_fpath, ec_mv);
+                        if (ec_mv) {
+                            // Si falla el rename, igualmente seguimos.
+                        }
+
+                        if (!cr.full_ok) {
+                            // No cumple la fórmula al 100%; solo nos interesa para análisis,
+                            // pero no detenemos la búsqueda.
+                            continue;
+                        }
+
+                        // H cumple la fórmula en todas las configuraciones
                         bool expected = false;
                         if (found.compare_exchange_strong(expected, true)) {
-                            formula_log << "ENCONTRADA\n";
-                            formula_log.flush();
-
-                            // Si no había log principal para este H, crearlo ahora
+                            // Somos el primer hilo en encontrar un H válido
                             if (!log_main) {
+                                // No se había generado log principal, lo creamos ahora
                                 main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
                                 std::ofstream mf(main_fpath);
                                 if (mf) {
