@@ -12,6 +12,7 @@
 #include <array>
 #include <streambuf>
 #include <deque>
+#include <condition_variable>
 
 struct NullBuffer : public std::streambuf {
     int overflow(int c) override { return c; }
