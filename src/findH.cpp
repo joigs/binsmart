@@ -11,6 +11,7 @@
 #include <fstream>
 #include <array>
 #include <streambuf>
+#include <deque>
 
 struct NullBuffer : public std::streambuf {
     int overflow(int c) override { return c; }
@@ -329,11 +330,17 @@ static void for_each_combination(int n, int k, F f) {
     }
 }
 
+// Trabajo = grupo de reglas de símbolos consecutivas
+struct RuleJob {
+    long long sym_first_idx;                 // índice de la primera regla
+    std::vector<std::vector<char>> rules;    // cada una tiene tamaño S
+};
+
 int main(int argc, char** argv) {
     std::string logdir = "logs_tmt";
     long long progress_interval = 100000;
     unsigned int requested_threads = 0;    // 0 => usar hardware_concurrency
-    long long chunk_size = 10000;          // nº de H por bloque por hilo
+    long long chunk_size = 10000;          // nº de H por bloque aproximado
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -403,63 +410,69 @@ int main(int argc, char** argv) {
         }
 
         std::atomic<long long> tested(0);
-        long long sym_rule_idx = 0;
-        int half = S / 2;
 
-        for_each_combination(S, half, [&](const std::vector<int>& ones) {
-            if (found.load()) return;
+        // Cola de trabajos (grupos de reglas)
+        std::deque<RuleJob> job_queue;
+        std::mutex job_mutex;
+        std::condition_variable job_cv;
+        bool jobs_done = false;
 
-            std::vector<char> rule_bits(S, '0');
-            for (int idx : ones) rule_bits[idx] = '1';
+        // Nº de hilos trabajadores (solo verifican H; el hilo principal gestiona trabajos)
+        unsigned int thread_count = requested_threads;
+        if (thread_count == 0) {
+            thread_count = std::thread::hardware_concurrency();
+            if (thread_count == 0) thread_count = 1;
+        }
+        if (thread_count > perms.size())
+            thread_count = static_cast<unsigned int>(perms.size());
 
-            long long base_idx = sym_rule_idx * inv_count;
-            sym_rule_idx++;
+        // Hilos trabajadores
+        std::vector<std::thread> workers;
+        workers.reserve(thread_count);
 
-            unsigned int thread_count = requested_threads;
-            if (thread_count == 0) {
-                thread_count = std::thread::hardware_concurrency();
-                if (thread_count == 0) thread_count = 1;
-            }
-            if (thread_count > perms.size())
-                thread_count = static_cast<unsigned int>(perms.size());
+        for (unsigned int t = 0; t < thread_count; ++t) {
+            workers.emplace_back([&, t]() {
+                int neighborhood_len = K;
+                NullBuffer nbuf;
+                std::ostream devnull(&nbuf);
+                bool is_logger_thread = (t == 0);
 
-            std::atomic<long long> next_perm_chunk(0);
+                while (true) {
+                    if (found.load()) return;
 
-            std::vector<std::thread> threads;
-            threads.reserve(thread_count);
+                    RuleJob job;
 
-            for (unsigned int t = 0; t < thread_count; ++t) {
-                threads.emplace_back([&, t, base_idx, thread_count]() {
-                    int neighborhood_len = K;
-                    NullBuffer nbuf;
-                    std::ostream devnull(&nbuf);
+                    {
+                        std::unique_lock<std::mutex> lock(job_mutex);
+                        job_cv.wait(lock, [&] {
+                            return found.load() || !job_queue.empty() || jobs_done;
+                        });
+                        if (found.load()) return;
+                        if (job_queue.empty()) {
+                            if (jobs_done) return;
+                            continue;
+                        }
+                        job = std::move(job_queue.front());
+                        job_queue.pop_front();
+                    }
 
-                    bool is_logger_thread = (t == 0);
+                    for (std::size_t jr = 0; jr < job.rules.size() && !found.load(); ++jr) {
+                        const std::vector<char>& rule_bits = job.rules[jr];
+                        long long sym_idx = job.sym_first_idx + static_cast<long long>(jr);
+                        long long base_idx = sym_idx * inv_count;
 
-                    std::size_t nperms = perms.size();
+                        for (std::size_t p_idx = 0;
+                             p_idx < perms.size() && !found.load();
+                             ++p_idx) {
 
-                    while (!found.load()) {
-                        long long start_ll = next_perm_chunk.fetch_add(chunk_size);
-                        if (start_ll >= (long long)nperms) break;
-                        long long end_ll = start_ll + chunk_size;
-                        if (end_ll > (long long)nperms) end_ll = (long long)nperms;
-
-                        for (long long p_idx_ll = start_ll;
-                             p_idx_ll < end_ll && !found.load();
-                             ++p_idx_ll) {
-
-                            std::size_t p_idx = static_cast<std::size_t>(p_idx_ll);
-                            long long h_idx = base_idx + p_idx_ll + 1;
-
-                            long long tnum = tested.fetch_add(1) + 1;
+                            long long h_idx0 = base_idx + static_cast<long long>(p_idx);
+                            long long h_id   = h_idx0 + 1;
+                            long long tnum   = tested.fetch_add(1) + 1;
 
                             bool do_progress = false;
                             if (is_logger_thread && progress_interval > 0 &&
                                 (tnum % progress_interval == 0)) {
                                 do_progress = true;
-                            }
-
-                            if (do_progress) {
                                 std::lock_guard<std::mutex> lock(io_mutex);
                                 std::cout << "r=" << r << " progreso: "
                                           << tnum << " de "
@@ -467,175 +480,164 @@ int main(int argc, char** argv) {
                                 std::cout.flush();
                             }
 
-                            // Solo el hilo logger escribe log principal periódico
-                            bool log_main = do_progress;
-
-                            std::filesystem::path main_fpath;
-                            std::ofstream main_log;
-                            std::ostream* main_logp = &devnull;
-
-                            if (log_main) {
-                                main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                                main_log.open(main_fpath);
-                                if (main_log) {
-                                    main_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                             << "\n";
-                                    main_log << fmt_perm(perms[p_idx]) << "\n";
-                                    main_logp = &main_log;
-                                } else {
-                                    log_main = false;
-                                    main_logp = &devnull;
-                                }
-                            }
-
+                            // Chequeos sin log (salida a /dev/null)
                             bool invol_ok = verify_involution_over_tapes(
                                 r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                *main_logp
+                                devnull
                             );
                             if (!invol_ok) {
                                 continue;
                             }
 
-                            // Llegó al punto de intentar la fórmula:
-                            // log temporal en formula_rdir, luego se reclasifica si pasa >=75%
-                            std::filesystem::path tmp_fpath =
-                                formula_rdir / ("H_" + std::to_string(h_idx) + ".log.tmp");
-                            std::ofstream formula_log(tmp_fpath);
-                            if (!formula_log) {
-                                // No se pudo abrir log de fórmula, pero igual probamos sin log
-                                NullBuffer nbuf2;
-                                std::ostream devnull2(&nbuf2);
-                                bool inv2 = verify_involution_over_tapes(
-                                    r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                    devnull2
-                                );
-                                if (!inv2) continue;
-                                ConjugacyResult cr2 = verify_conjugacy_over_tapes(
-                                    r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                    devnull2
-                                );
-                                if (cr2.full_ok) {
-                                    bool expected = false;
-                                    if (found.compare_exchange_strong(expected, true)) {
-                                        std::lock_guard<std::mutex> lock(io_mutex);
-                                        found_path = tmp_fpath.string();
-                                        found_r = r;
-                                        std::cout << "H encontrada en r=" << r
-                                                  << ", pero no se pudo escribir log\n";
-                                        std::cout.flush();
-                                    }
-                                }
-                                return;
-                            }
-
-                            // Encabezado en log de fórmula
-                            formula_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                        << "\n";
-                            formula_log << fmt_perm(perms[p_idx]) << "\n";
-
-                            bool invol_ok2 = verify_involution_over_tapes(
-                                r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                formula_log
-                            );
-                            if (!invol_ok2) {
-                                formula_log.flush();
-                                formula_log.close();
-                                std::error_code ec_rm;
-                                std::filesystem::remove(tmp_fpath, ec_rm);
-                                continue;
-                            }
-
                             ConjugacyResult cr = verify_conjugacy_over_tapes(
                                 r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                formula_log
+                                devnull
                             );
 
-                            formula_log.flush();
-                            formula_log.close();
-
-                            // Clasificación: solo guardamos si pasa >= 75% de las combinaciones
                             long double ratio = 0.0L;
                             if (cr.total > 0) {
                                 ratio = (long double)cr.succeeded / (long double)cr.total;
                             }
 
-                            if (!cr.full_ok && ratio < 0.75L) {
-                                // Pasa menos del 75%: no nos interesa, borramos el log
-                                std::error_code ec_rm;
-                                std::filesystem::remove(tmp_fpath, ec_rm);
-                                continue;
-                            }
+                            bool need_formula_log = cr.full_ok || (ratio >= 0.75L);
+                            bool need_main_log    = do_progress;
 
-                            // Aquí ratio >= 0.75 o full_ok
-                            std::filesystem::path target_dir = formula_rdir / "75";
-                            if (cr.full_ok) {
-                                target_dir /= "100";
-                            }
-
-                            std::error_code ec_mk;
-                            std::filesystem::create_directories(target_dir, ec_mk);
-
-                            std::filesystem::path formula_fpath =
-                                target_dir / ("H_" + std::to_string(h_idx) + ".log");
-
-                            std::error_code ec_mv;
-                            std::filesystem::rename(tmp_fpath, formula_fpath, ec_mv);
-
-                            if (!cr.full_ok) {
-                                // No cumple la fórmula al 100%; solo nos interesa para análisis,
-                                // pero no detenemos la búsqueda.
-                                continue;
-                            }
-
-                            // H cumple la fórmula en todas las configuraciones
-                            bool expected = false;
-                            if (found.compare_exchange_strong(expected, true)) {
-                                // Somos el primer hilo en encontrar un H válido
-                                if (!log_main) {
-                                    // No se había generado log principal, lo creamos ahora
-                                    main_fpath = rdir / ("H_" + std::to_string(h_idx) + ".log");
-                                    std::ofstream mf(main_fpath);
-                                    if (mf) {
-                                        mf << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                           << "\n";
-                                        mf << fmt_perm(perms[p_idx]) << "\n";
-                                        verify_involution_over_tapes(
-                                            r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                            mf
-                                        );
-                                        verify_conjugacy_over_tapes(
-                                            r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                            mf
-                                        );
-                                        mf << "ENCONTRADA\n";
-                                        mf.flush();
-                                    }
-                                } else {
-                                    if (main_log) {
+                            // Log de muestra cada progress_interval (en rdir/)
+                            if (need_main_log) {
+                                std::filesystem::path main_fpath =
+                                    rdir / ("H_" + std::to_string(h_id) + ".log");
+                                std::ofstream main_log(main_fpath);
+                                if (main_log) {
+                                    main_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                             << "\n";
+                                    main_log << fmt_perm(perms[p_idx]) << "\n";
+                                    verify_involution_over_tapes(
+                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                        main_log
+                                    );
+                                    verify_conjugacy_over_tapes(
+                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                        main_log
+                                    );
+                                    if (cr.full_ok) {
                                         main_log << "ENCONTRADA\n";
-                                        main_log.flush();
                                     }
+                                    main_log.flush();
+                                }
+                            }
+
+                            // Logs en formula/75 y formula/75/100 para H que pasan >=75%
+                            std::filesystem::path formula_fpath;
+                            if (need_formula_log) {
+                                std::filesystem::path target_dir = formula_rdir / "75";
+                                if (cr.full_ok) {
+                                    target_dir /= "100";
                                 }
 
-                                {
+                                std::error_code ec_mk;
+                                std::filesystem::create_directories(target_dir, ec_mk);
+
+                                formula_fpath =
+                                    target_dir / ("H_" + std::to_string(h_id) + ".log");
+
+                                std::ofstream f(formula_fpath);
+                                if (f) {
+                                    f << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
+                                      << "\n";
+                                    f << fmt_perm(perms[p_idx]) << "\n";
+                                    verify_involution_over_tapes(
+                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                        f
+                                    );
+                                    verify_conjugacy_over_tapes(
+                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
+                                        f
+                                    );
+                                    if (cr.full_ok) {
+                                        f << "ENCONTRADA\n";
+                                    }
+                                    f.flush();
+                                }
+                            }
+
+                            if (cr.full_ok) {
+                                bool expected = false;
+                                if (found.compare_exchange_strong(expected, true)) {
                                     std::lock_guard<std::mutex> lock(io_mutex);
-                                    found_path = formula_fpath.string();
+                                    if (need_formula_log) {
+                                        // full_ok => fue a formula/75/100
+                                        found_path = (formula_rdir / "75" / "100" /
+                                                      ("H_" + std::to_string(h_id) + ".log")).string();
+                                    } else if (need_main_log) {
+                                        found_path =
+                                            (rdir / ("H_" + std::to_string(h_id) + ".log")).string();
+                                    } else {
+                                        // Ningún log se generó; al menos indicamos el id
+                                        found_path = "H_" + std::to_string(h_id) + " (sin log)";
+                                    }
                                     found_r = r;
                                     std::cout << "H encontrada en r=" << r
+                                              << ", H_id=" << h_id
                                               << ", archivo=" << found_path << "\n";
                                     std::cout.flush();
                                 }
+                                return;
                             }
+                        } // perms
+                    } // reglas del trabajo
+                } // while true
+            }); // worker
+        } // for t
 
-                            return;  // este hilo ya no necesita seguir procesando más perms
-                        } // for p_idx_ll
-                    } // while bloques
-                });
+        // Hilo gestor: genera trabajos (RuleJob) en función de chunk_size ~ nº de H
+        long long rules_per_job = chunk_size / inv_count;
+        if (rules_per_job < 1) rules_per_job = 1;
+
+        long long sym_rule_idx = 0;
+        int half = S / 2;
+
+        RuleJob current_job;
+        current_job.sym_first_idx = 0;
+
+        for_each_combination(S, half, [&](const std::vector<int>& ones) {
+            if (found.load()) return;
+
+            std::vector<char> rule_bits(S, '0');
+            for (int idx : ones) rule_bits[idx] = '1';
+
+            if (current_job.rules.empty()) {
+                current_job.sym_first_idx = sym_rule_idx;
             }
+            current_job.rules.push_back(std::move(rule_bits));
+            ++sym_rule_idx;
 
-            for (auto& th : threads) th.join();
+            if ((long long)current_job.rules.size() >= rules_per_job) {
+                {
+                    std::lock_guard<std::mutex> lock(job_mutex);
+                    job_queue.push_back(std::move(current_job));
+                }
+                job_cv.notify_one();
+                current_job = RuleJob();
+            }
+        });
 
-        }); // for_each_combination
+        // Último bloque parcial
+        if (!found.load() && !current_job.rules.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                job_queue.push_back(std::move(current_job));
+            }
+            job_cv.notify_all();
+        }
+
+        // Señal de que no habrá más trabajos
+        {
+            std::lock_guard<std::mutex> lock(job_mutex);
+            jobs_done = true;
+        }
+        job_cv.notify_all();
+
+        for (auto& th : workers) th.join();
 
         if (found.load()) break;
 
