@@ -4,6 +4,9 @@ project(binsmart LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Encuentra la librería de hilos del sistema (pthread en Linux)
+find_package(Threads REQUIRED)  # <- AGREGAR ESTO
+
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -18,4 +21,5 @@ add_executable(inversa src/inversa.cpp)
 target_link_libraries(inversa PRIVATE tm)
 
 add_executable(findH src/findH.cpp)
-target_link_libraries(findH PRIVATE tm)
+# Linkea tm Y TAMBIÉN Threads::Threads
+target_link_libraries(findH PRIVATE tm Threads::Threads) # <- MODIFICAR ESTO

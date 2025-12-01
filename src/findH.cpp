@@ -10,646 +10,309 @@
 #include <cmath>
 #include <fstream>
 #include <array>
-#include <streambuf>
-#include <deque>
-#include <condition_variable>
+#include <random>
+#include <chrono>
+#include <algorithm>
+#include <iomanip>
 
-struct NullBuffer : public std::streambuf {
-    int overflow(int c) override { return c; }
+// --- CONFIGURACIÓN DE BÚSQUEDA ---
+const int R_TARGET = 3;
+const int SAMPLE_SIZE = 2000;       // Cuantas cintas aleatorias probar para calcular el %
+const int MAX_STAGNATION = 5000;    // Si no mejora tras X intentos, reinicia (Random Restart)
+const int PRINT_INTERVAL_SEC = 300; // 5 minutos (300 segundos)
+
+// Estructuras globales para monitoreo
+struct SearchStats {
+    std::atomic<double> best_involution_pct;
+    std::atomic<double> best_formula_pct;
+    std::atomic<unsigned long long> restarts;
+    std::atomic<unsigned long long> mutations_tried;
 };
 
-struct ConjugacyResult {
-    bool full_ok;                  // true si pasó todas las configuraciones
-    unsigned long long succeeded;  // cuántas configuraciones cumplieron la fórmula
-    unsigned long long total;      // total de configuraciones
-};
+SearchStats global_stats{0.0, 0.0, 0, 0};
 
-static bool apply_symbol_CA(const std::string& word, int r, int neighborhood_len,
-                            const std::vector<char>& rule_bits, std::string& out) {
-    int L = static_cast<int>(word.size());
-    out.clear();
-    out.reserve(L);
-    int K = neighborhood_len;
-    int S = static_cast<int>(rule_bits.size());
-    if (S != (1 << K)) return false;
+// --- FUNCIONES AUXILIARES ---
+
+// Genera una palabra aleatoria de longitud L
+static std::string random_word(int L, std::mt19937& rng) {
+    std::string w(L, '0');
+    std::uniform_int_distribution<int> dist(0, 1);
     for (int i = 0; i < L; ++i) {
-        int idx = 0;
-        for (int j = i - r; j <= i + r; ++j) {
-            char b = '0';
-            if (j >= 0 && j < L) b = word[j];
-            idx = (idx << 1) | (b == '1' ? 1 : 0);
-        }
-        char v = rule_bits[idx];
-        out.push_back(v);
+        if (dist(rng)) w[i] = '1';
     }
-    return true;
+    return w;
 }
 
-static bool apply_H_TMT(const std::string& word, int pos, const std::string& qlbl,
-                        int r, int neighborhood_len, const std::vector<char>& rule_bits,
-                        const std::array<int,8>& perm,
-                        std::string& w2, int& pos2, std::string& q2) {
-    if (!apply_symbol_CA(word, r, neighborhood_len, rule_bits, w2)) return false;
-    int qi = state_index_from_label(qlbl);
+// Aplica CA (Símbolo)
+static char apply_rule_bit(const std::string& word, int i, int r, int L, const std::vector<char>& rule_bits) {
+    int idx = 0;
+    for (int j = i - r; j <= i + r; ++j) {
+        char b = '0';
+        if (j >= 0 && j < L) b = word[j];
+        idx = (idx << 1) | (b == '1' ? 1 : 0);
+    }
+    return rule_bits[idx];
+}
+
+// Aplica H completo (Símbolo + Estado)
+static bool apply_H_single(const std::string& w, int pos, const std::string& q,
+                           int r, int L, const std::vector<char>& rule_bits,
+                           const std::array<int, 8>& perm,
+                           std::string& w_out, int& pos_out, std::string& q_out) {
+    w_out.resize(L);
+    for(int i=0; i<L; ++i) {
+        w_out[i] = apply_rule_bit(w, i, r, L, rule_bits);
+    }
+    int qi = state_index_from_label(q);
     if (qi < 0) return false;
-    int qnext = perm[qi];
-    pos2 = pos;
-    q2 = STATE_LABELS[qnext];
+    pos_out = pos;
+    q_out = STATE_LABELS[perm[qi]];
     return true;
 }
 
-static std::string fmt_rule_bits_table(const std::vector<char>& rule_bits,
-                                       int r, int neighborhood_len) {
-    std::ostringstream oss;
-    oss << "SIMBOLOS r=" << r << "\n";
-    int S = static_cast<int>(rule_bits.size());
-    int K = neighborhood_len;
-    for (int idx = 0; idx < S; ++idx) {
-        std::string key(K, '0');
-        for (int b = 0; b < K; ++b) {
-            int bitpos = K - 1 - b;
-            char c = (idx & (1 << bitpos)) ? '1' : '0';
-            key[b] = c;
+// Evalúa % de éxito de H o H (Involución)
+// Retorna un double entre 0.0 y 1.0
+static double score_involution(int r, int L, const std::vector<char>& rule_bits,
+                               const std::array<int, 8>& perm,
+                               std::mt19937& rng, int samples) {
+    int successes = 0;
+    std::uniform_int_distribution<int> dist_pos(0, L - 1);
+    std::uniform_int_distribution<int> dist_state(0, 7);
+
+    for (int i = 0; i < samples; ++i) {
+        std::string w = random_word(L, rng);
+        int pos = dist_pos(rng);
+        std::string q = STATE_LABELS[dist_state(rng)];
+
+        std::string w1, q1; int pos1;
+        if (!apply_H_single(w, pos, q, r, L, rule_bits, perm, w1, pos1, q1)) continue;
+
+        std::string w2, q2; int pos2;
+        if (!apply_H_single(w1, pos1, q1, r, L, rule_bits, perm, w2, pos2, q2)) continue;
+
+        if (w == w2 && pos == pos2 && q == q2) {
+            successes++;
         }
-        std::string left, center, right;
-        if (K == 3) {
-            left   = key.substr(0, 1);
-            center = key.substr(1, 1);
-            right  = key.substr(2);
-        } else {
-            int mid = K / 2;
-            left   = key.substr(0, mid);
-            center = key.substr(mid, 1);
-            right  = key.substr(mid + 1);
-        }
-        oss << "  (" << left << "|" << center << "|" << right
-            << ") -> " << rule_bits[idx] << "\n";
     }
-    return oss.str();
+    return (double)successes / (double)samples;
 }
 
-static std::string fmt_perm(const std::array<int,8>& perm) {
-    std::ostringstream oss;
-    oss << "ESTADOS sigma (involucion)\n";
-    for (int i = 0; i < 8; ++i) {
-        oss << "  " << STATE_LABELS[i] << " -> " << STATE_LABELS[perm[i]] << "\n";
+// Evalúa % de éxito de la Fórmula T^-1 = H T H
+static double score_formula(int r, int L, const std::vector<char>& rule_bits,
+                            const std::array<int, 8>& perm,
+                            std::mt19937& rng, int samples) {
+    int successes = 0;
+    std::uniform_int_distribution<int> dist_pos(0, L - 1);
+    std::uniform_int_distribution<int> dist_state(0, 7);
+
+    for (int i = 0; i < samples; ++i) {
+        std::string w = random_word(L, rng);
+        int pos = dist_pos(rng);
+        std::string q = STATE_LABELS[dist_state(rng)];
+
+        // Lado Izquierdo: T^-1(x)
+        RunResult resInv = run_inversa(1, w, pos, q);
+        if (!resInv.ok) continue; // Si T^-1 falla, ignoramos muestra o contamos como fallo según criterio (aquí ignoramos)
+
+        // Lado Derecho: H(T(H(x)))
+        // 1. H(x)
+        std::string wH, qH; int posH;
+        if (!apply_H_single(w, pos, q, r, L, rule_bits, perm, wH, posH, qH)) continue;
+
+        // 2. T(H(x))
+        RunResult resT = run_original(1, wH, posH, qH);
+        if (!resT.ok) continue;
+
+        // 3. H(T(H(x)))
+        std::string wHTH, qHTH; int posHTH;
+        if (!apply_H_single(resT.word_out, resT.pos_out, resT.state_out, r, L, rule_bits, perm, wHTH, posHTH, qHTH)) continue;
+
+        // Comparar
+        if (wHTH == resInv.word_out && posHTH == (int)resInv.pos_out && qHTH == resInv.state_out) {
+            successes++;
+        }
     }
-    return oss.str();
+    return (double)successes / (double)samples;
 }
 
-// H∘H: muestreo uniforme de ejemplos “ok H∘H” para no inflar el log
-static bool verify_involution_over_tapes(int r, int L, int neighborhood_len,
-                                         const std::vector<char>& rule_bits,
-                                         const std::array<int,8>& perm,
-                                         std::ostream& logf) {
-    if (L <= 0 || L >= 63) return false;
-    unsigned long long words = 1ULL << L;
-    unsigned long long total_x = words * (unsigned long long)L * 8ULL;
+// Función auxiliar para imprimir la regla
+static void log_solution(const std::string& filename, const std::vector<char>& rule_bits,
+                         const std::array<int,8>& perm, int r, double inv_score, double form_score) {
+    std::ofstream f(filename);
+    f << "R=" << r << "\n";
+    f << "Involution Score: " << inv_score * 100.0 << "%\n";
+    f << "Formula Score: " << form_score * 100.0 << "%\n";
+    f << "Permutation: ";
+    for(int i : perm) f << STATE_LABELS[i] << " ";
+    f << "\nRule Bits: ";
+    for(char c : rule_bits) f << c;
+    f << "\n";
+}
 
-    const std::size_t MAX_OK_LOG_INV = 100;  // nº máximo de ejemplos “ok H∘H” por H
-    unsigned long long stride = (MAX_OK_LOG_INV > 0 && total_x > MAX_OK_LOG_INV)
-                              ? (total_x / MAX_OK_LOG_INV)
-                              : 1ULL;
-    std::size_t ok_logged = 0;
+// --- HILO MONITOR ---
+void monitor_thread_func() {
+    auto start_time = std::chrono::steady_clock::now();
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(PRINT_INTERVAL_SEC));
 
-    unsigned long long ti = 0;  // índice global de configuración
-    for (unsigned long long mask = 0; mask < words; ++mask) {
-        std::string w(L, '0');
-        for (int i = 0; i < L; ++i) {
-            unsigned long long bit = 1ULL << (L - 1 - i);
-            if (mask & bit) w[i] = '1';
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - start_time).count();
+
+        double current_best_inv = global_stats.best_involution_pct.load();
+        double current_best_frm = global_stats.best_formula_pct.load();
+        unsigned long long rst = global_stats.restarts.load();
+        unsigned long long mut = global_stats.mutations_tried.load();
+
+        std::cout << "\n[" << elapsed << " min] REPORTE DE PROGRESO (R=" << R_TARGET << ")\n";
+        std::cout << "  > Mejor H o H encontrado: " << std::fixed << std::setprecision(4) << (current_best_inv * 100.0) << "%\n";
+        std::cout << "  > Mejor Formula encontrada: " << std::fixed << std::setprecision(4) << (current_best_frm * 100.0) << "%\n";
+        std::cout << "  > Reinicios totales: " << rst << "\n";
+        std::cout << "  > Mutaciones probadas: " << mut << "\n";
+        std::cout << "----------------------------------------" << std::endl;
+    }
+}
+
+// --- HILO TRABAJADOR (HILL CLIMBING) ---
+void worker_thread(int thread_id, std::vector<std::array<int,8>> perms, std::string logdir) {
+    std::random_device rd;
+    std::mt19937 rng(rd() + thread_id); // Semilla única por hilo
+
+    int K = 2 * R_TARGET + 1;
+    int S = 1 << K; // 128 bits para r=3
+    int L = 2 * (2 * R_TARGET) + 1; // Longitud de cinta para pruebas
+
+    // Distribuciones
+    std::uniform_int_distribution<int> dist_bit_idx(0, S - 1);
+    std::uniform_int_distribution<int> dist_perm_idx(0, perms.size() - 1);
+
+    while (true) {
+        // --- PASO 1: REINICIO ALEATORIO ---
+        global_stats.restarts.fetch_add(1);
+
+        // 1. Elegir permutación aleatoria (fija para este intento de escalada)
+        std::array<int, 8> current_perm = perms[dist_perm_idx(rng)];
+
+        // 2. Generar bits de regla aleatorios (balanceados o puros random)
+        std::vector<char> current_rule(S);
+        for(int i=0; i<S; ++i) current_rule[i] = (rng() % 2) ? '1' : '0';
+
+        double current_inv_score = score_involution(R_TARGET, L, current_rule, current_perm, rng, SAMPLE_SIZE);
+
+        // Actualizar global si es récord
+        double global_best = global_stats.best_involution_pct.load();
+        if (current_inv_score > global_best) {
+            global_stats.best_involution_pct.store(current_inv_score);
         }
-        for (int pos = 0; pos < L; ++pos) {
-            for (int qi = 0; qi < 8; ++qi) {
-                const std::string& q = STATE_LABELS[qi];
-                std::string w1;
-                int pos1;
-                std::string q1;
-                if (!apply_H_TMT(w, pos, q, r, neighborhood_len,
-                                  rule_bits, perm, w1, pos1, q1)) {
-                    logf << "x#" << ti << " H indefinida | x=("
-                         << w << "; head=" << pos << "; state=" << q << ")\n";
-                    return false;
-                }
-                std::string w2;
-                int pos2;
-                std::string q2;
-                if (!apply_H_TMT(w1, pos1, q1, r, neighborhood_len,
-                                  rule_bits, perm, w2, pos2, q2)) {
-                    logf << "x#" << ti << " H∘H indefinida | x=("
-                         << w << "; head=" << pos << "; state=" << q
-                         << ") | Hx=(" << w1 << "; " << pos1 << "; " << q1 << ")\n";
-                    return false;
-                }
-                if (!(w2 == w && pos2 == pos && q2 == q)) {
-                    logf << "x#" << ti << " H∘H(x) != x\n";
-                    logf << "x    = (" << w << "; head=" << pos << "; state=" << q << ")\n";
-                    logf << "Hx   = (" << w1 << "; head=" << pos1 << "; state=" << q1 << ")\n";
-                    logf << "HHx  = (" << w2 << "; head=" << pos2 << "; state=" << q2 << ")\n";
-                    return false;
+
+        int stagnation_counter = 0;
+
+        // --- PASO 2: ESCALADA (HILL CLIMBING) ---
+        while (stagnation_counter < MAX_STAGNATION) {
+            global_stats.mutations_tried.fetch_add(1);
+
+            // Mutar: invertir un bit al azar
+            int flip_idx = dist_bit_idx(rng);
+            current_rule[flip_idx] = (current_rule[flip_idx] == '1' ? '0' : '1');
+
+            double new_inv_score = score_involution(R_TARGET, L, current_rule, current_perm, rng, SAMPLE_SIZE);
+
+            // Criterio de aceptación:
+            // Si mejora o iguala (para navegar mesetas), nos quedamos.
+            // Si empeora, revertimos.
+            if (new_inv_score >= current_inv_score) {
+                current_inv_score = new_inv_score;
+                // Si mejoró estrictamente, reseteamos estancamiento
+                if (new_inv_score > current_inv_score) stagnation_counter = 0;
+                else stagnation_counter++; // Si es igual, cuenta como estancamiento leve
+
+                // Actualizar record global
+                double gb = global_stats.best_involution_pct.load();
+                if (current_inv_score > gb) global_stats.best_involution_pct.store(current_inv_score);
+            } else {
+                // Revertir cambio
+                current_rule[flip_idx] = (current_rule[flip_idx] == '1' ? '0' : '1');
+                stagnation_counter++;
+            }
+
+            // --- SI INVOLUCIÓN ES PERFECTA (o muy alta), PROBAR FORMULA ---
+            if (current_inv_score >= 0.99) { // Umbral para pasar a fase 2
+                double frm_score = score_formula(R_TARGET, L, current_rule, current_perm, rng, SAMPLE_SIZE);
+
+                double gb_frm = global_stats.best_formula_pct.load();
+                if (frm_score > gb_frm) {
+                    global_stats.best_formula_pct.store(frm_score);
+
+                    // Guardar hallazgo interesante
+                    if (frm_score > 0.5) {
+                        std::string fname = logdir + "/candidate_F" + std::to_string((int)(frm_score*100)) +
+                                            "_I" + std::to_string((int)(current_inv_score*100)) +
+                                            "_T" + std::to_string(thread_id) + "_" + std::to_string(rng()) + ".log";
+                        log_solution(fname, current_rule, current_perm, R_TARGET, current_inv_score, frm_score);
+                        std::cout << "\n!!! HALLAZGO EN HILO " << thread_id << ": Formula " << (frm_score*100) << "%\n";
+                    }
                 }
 
-                if (ok_logged < MAX_OK_LOG_INV && (ti % stride == 0)) {
-                    logf << "x#" << ti << " ok H∘H | x=("
-                         << w << ";" << pos << ";" << q
-                         << ") | Hx=(" << w1 << ";" << pos1 << ";" << q1
-                         << ") | HHx=(" << w2 << ";" << pos2 << ";" << q2 << ")\n";
-                    ++ok_logged;
+                // Si logramos la perfección, seguimos optimizando la formula en vez de la involución
+                // (Pequeña variación de lógica: si Inv es 100%, solo aceptamos cambios que mantengan Inv 100% Y mejoren Formula)
+                if (frm_score >= 0.999 && current_inv_score >= 0.999) {
+                     std::string fname = logdir + "/SOLUTION_FOUND.log";
+                     log_solution(fname, current_rule, current_perm, R_TARGET, current_inv_score, frm_score);
+                     std::cout << "\n!!! SOLUCIÓN ENCONTRADA !!!\n";
+                     exit(0);
                 }
-
-                ++ti;
             }
         }
+        // Fin del while de escalada -> Reinicio aleatorio (Random Restart)
     }
-    return true;
 }
 
-// Fórmula T^{-1} = H∘T∘H, con muestreo + contadores para clasificación
-static ConjugacyResult verify_conjugacy_over_tapes(
-    int r, int L, int neighborhood_len,
-    const std::vector<char>& rule_bits,
-    const std::array<int,8>& perm,
-    std::ostream& logf
-) {
-    ConjugacyResult res;
-    res.full_ok   = false;
-    res.succeeded = 0;
-    res.total     = 0;
-
-    if (L <= 0 || L >= 63) return res;
-
-    unsigned long long words = 1ULL << L;
-    unsigned long long total_x = words * (unsigned long long)L * 8ULL;
-    res.total = total_x;
-
-    const std::size_t MAX_OK_LOG = 64;  // nº máximo de ejemplos “ok formula” por H
-    unsigned long long stride = (MAX_OK_LOG > 0 && total_x > MAX_OK_LOG)
-                              ? (total_x / MAX_OK_LOG)
-                              : 1ULL;
-    std::size_t ok_logged = 0;
-
-    unsigned long long ti = 0;
-    for (unsigned long long mask = 0; mask < words; ++mask) {
-        std::string w(L, '0');
-        for (int i = 0; i < L; ++i) {
-            unsigned long long bit = 1ULL << (L - 1 - i);
-            if (mask & bit) w[i] = '1';
-        }
-        for (int pos = 0; pos < L; ++pos) {
-            for (int qi = 0; qi < 8; ++qi) {
-                const std::string& q = STATE_LABELS[qi];
-
-                std::string wH; int posH; std::string qH;
-                if (!apply_H_TMT(w, pos, q, r, neighborhood_len,
-                                  rule_bits, perm, wH, posH, qH)) {
-                    logf << "x#" << ti << " H indefinida\n";
-                    return res;  // succeeded se mantiene
-                }
-
-                RunResult resT = run_original(1, wH, posH, qH);
-                if (!resT.ok) {
-                    logf << "x#" << ti << " T fallo\n";
-                    return res;
-                }
-                std::string wTH  = resT.word_out;
-                int         posTH = (int)resT.pos_out;
-                std::string qTH  = resT.state_out;
-
-                std::string wHTH; int posHTH; std::string qHTH;
-                if (!apply_H_TMT(wTH, posTH, qTH, r, neighborhood_len,
-                                  rule_bits, perm, wHTH, posHTH, qHTH)) {
-                    logf << "x#" << ti << " H en T(H(x)) indefinida\n";
-                    return res;
-                }
-
-                RunResult resInv = run_inversa(1, w, pos, q);
-                if (!resInv.ok) {
-                    logf << "x#" << ti << " T^-1 fallo\n";
-                    return res;
-                }
-                std::string wInv  = resInv.word_out;
-                int         posInv = (int)resInv.pos_out;
-                std::string qInv  = resInv.state_out;
-
-                if (!(wHTH == wInv && posHTH == posInv && qHTH == qInv)) {
-                    logf << "x#" << ti << " no cumple T^-1 = H∘T∘H\n";
-                    logf << "x     = (" << w << ";" << pos << ";" << q << ")\n";
-                    logf << "Hx    = (" << wH << ";" << posH << ";" << qH << ")\n";
-                    logf << "THx   = (" << wTH << ";" << posTH << ";" << qTH << ")\n";
-                    logf << "HTHx  = (" << wHTH << ";" << posHTH << ";" << qHTH << ")\n";
-                    logf << "Tinvx = (" << wInv << ";" << posInv << ";" << qInv << ")\n";
-                    return res;
-                }
-
-                ++res.succeeded;
-
-                if (ok_logged < MAX_OK_LOG && (ti % stride == 0)) {
-                    logf << "x#" << ti << " ok formula | x=("
-                         << w << ";" << pos << ";" << q << ")\n";
-                    ++ok_logged;
-                }
-
-                ++ti;
-            }
-        }
-    }
-
-    res.full_ok = true;
-    return res;
-}
-
-static void involutive_permutations_dfs(int n,
-                                        std::vector<bool>& used,
-                                        std::array<int,8>& p,
-                                        int i,
-                                        std::vector<std::array<int,8>>& out) {
+// Generación de permutaciones (copiado y adaptado de tu código anterior)
+static void involutive_permutations_dfs(int n, std::vector<bool>& used, std::array<int,8>& p, int i, std::vector<std::array<int,8>>& out) {
     while (i < n && used[i]) ++i;
-    if (i == n) {
-        out.push_back(p);
-        return;
-    }
-    used[i] = true;
-    p[i] = i;
+    if (i == n) { out.push_back(p); return; }
+    used[i] = true; p[i] = i;
     involutive_permutations_dfs(n, used, p, i + 1, out);
     p[i] = -1;
     for (int j = i + 1; j < n; ++j) {
         if (!used[j]) {
-            used[j] = true;
-            p[i] = j;
-            p[j] = i;
+            used[j] = true; p[i] = j; p[j] = i;
             involutive_permutations_dfs(n, used, p, i + 1, out);
-            p[j] = -1;
-            used[j] = false;
+            p[j] = -1; used[j] = false;
         }
     }
     used[i] = false;
 }
 
-static std::vector<std::array<int,8>> generate_involutive_permutations_8() {
-    int n = 8;
-    std::vector<std::array<int,8>> out;
-    std::vector<bool> used(n, false);
-    std::array<int,8> p;
-    for (int i = 0; i < n; ++i) p[i] = -1;
-    involutive_permutations_dfs(n, used, p, 0, out);
-    return out;
-}
-
-static long long count_involutive_perms_8() {
-    int n = 8;
-    std::vector<long long> fact(n + 1);
-    fact[0] = 1;
-    for (int i = 1; i <= n; ++i) fact[i] = fact[i - 1] * i;
-    long long total = 0;
-    for (int k = 0; k <= n / 2; ++k) {
-        long long num = fact[n];
-        long long den = fact[k] * ((1LL << k)) * fact[n - 2 * k];
-        total += num / den;
-    }
-    return total;
-}
-
-template<typename F>
-static void for_each_combination(int n, int k, F f) {
-    if (k < 0 || k > n) return;
-    if (k == 0) {
-        std::vector<int> empty;
-        f(empty);
-        return;
-    }
-    std::vector<int> comb(k);
-    for (int i = 0; i < k; ++i) comb[i] = i;
-    while (true) {
-        f(comb);
-        int i;
-        for (i = k - 1; i >= 0; --i) {
-            if (comb[i] != i + n - k) break;
-        }
-        if (i < 0) break;
-        ++comb[i];
-        for (int j = i + 1; j < k; ++j) comb[j] = comb[j - 1] + 1;
-    }
-}
-
-// Trabajo = grupo de reglas de símbolos consecutivas
-struct RuleJob {
-    long long sym_first_idx;                 // índice de la primera regla
-    std::vector<std::vector<char>> rules;    // cada una tiene tamaño S
-};
-
-int main(int argc, char** argv) {
-    std::string logdir = "logs_tmt";
-    long long progress_interval = 100000;
-    unsigned int requested_threads = 0;    // 0 => usar hardware_concurrency
-    long long chunk_size = 10000;          // nº de H por bloque aproximado
-
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--logdir" && i + 1 < argc) {
-            logdir = argv[++i];
-        } else if (arg == "--progress-interval" && i + 1 < argc) {
-            progress_interval = std::stoll(argv[++i]);
-        } else if (arg == "--threads" && i + 1 < argc) {
-            requested_threads = static_cast<unsigned int>(std::stoul(argv[++i]));
-        } else if (arg == "--chunk-size" && i + 1 < argc) {
-            chunk_size = std::stoll(argv[++i]);
-        }
-    }
-    if (chunk_size < 1) chunk_size = 1;
-
+int main() {
+    std::string logdir = "logs_opt_r3";
     std::filesystem::create_directories(logdir);
-    long long inv_count = count_involutive_perms_8();
-    std::vector<std::array<int,8>> perms = generate_involutive_permutations_8();
 
-    std::atomic<bool> found(false);
-    std::string found_path;
-    int found_r = -1;
-    std::mutex io_mutex;
-
-    unsigned int hw = std::thread::hardware_concurrency();
+    std::cout << "Generando permutaciones involutivas..." << std::endl;
+    std::vector<std::array<int,8>> perms;
     {
-        std::lock_guard<std::mutex> lock(io_mutex);
-        std::cout << "hardware_concurrency=" << hw << "\n";
-        if (requested_threads > 0)
-            std::cout << "threads solicitados=" << requested_threads << "\n";
-        std::cout << "chunk_size=" << chunk_size << "\n";
-        std::cout.flush();
+        std::vector<bool> used(8, false);
+        std::array<int,8> p; p.fill(-1);
+        involutive_permutations_dfs(8, used, p, 0, perms);
+    }
+    std::cout << "Permutaciones: " << perms.size() << "\n";
+    std::cout << "Iniciando optimizacion heuristica para r=" << R_TARGET << "\n";
+    std::cout << "Nucleos disponibles: " << std::thread::hardware_concurrency() << "\n";
+    std::cout << "Reporte cada 5 minutos..." << std::endl;
+
+    // Hilo de monitoreo
+    std::thread monitor(monitor_thread_func);
+    monitor.detach();
+
+    // Hilos trabajadores
+    unsigned int n_workers = std::thread::hardware_concurrency();
+    if (n_workers == 0) n_workers = 4;
+
+    std::vector<std::thread> workers;
+    for(unsigned int i=0; i<n_workers; ++i) {
+        workers.emplace_back(worker_thread, i, perms, logdir);
     }
 
-    int r = 1;
-    while (true) {
-        int d = 2 * r;
-        int L = 2 * d + 1;
-        std::filesystem::path rdir =
-            std::filesystem::path(logdir) / ("r" + std::to_string(r));
-        std::filesystem::create_directories(rdir);
-        std::filesystem::path formula_rdir = rdir / "formula";
-        std::filesystem::create_directories(formula_rdir);
-
-        int K = 2 * r + 1;
-        int S = 1 << K;
-
-        long double num_sym_bal = 0.0L;
-        if (S % 2 == 0) {
-            int half = S / 2;
-            long double c = 1.0L;
-            for (int i = 1; i <= half; ++i) {
-                c *= static_cast<long double>(S + 1 - i);
-                c /= static_cast<long double>(i);
-            }
-            num_sym_bal = c;
-        }
-        long double total_H = num_sym_bal * static_cast<long double>(inv_count);
-
-        {
-            std::lock_guard<std::mutex> lock(io_mutex);
-            std::cout << "Iniciando r=" << r
-                      << ", L=" << L
-                      << ", H_balanceadas_max=" << static_cast<long double>(total_H)
-                      << "\n";
-            std::cout.flush();
-        }
-
-        std::atomic<long long> tested(0);
-
-        // Cola de trabajos (grupos de reglas)
-        std::deque<RuleJob> job_queue;
-        std::mutex job_mutex;
-        std::condition_variable job_cv;
-        bool jobs_done = false;
-
-        // Nº de hilos trabajadores (solo verifican H; el hilo principal gestiona trabajos)
-        unsigned int thread_count = requested_threads;
-        if (thread_count == 0) {
-            thread_count = std::thread::hardware_concurrency();
-            if (thread_count == 0) thread_count = 1;
-        }
-        if (thread_count > perms.size())
-            thread_count = static_cast<unsigned int>(perms.size());
-
-        // Hilos trabajadores
-        std::vector<std::thread> workers;
-        workers.reserve(thread_count);
-
-        for (unsigned int t = 0; t < thread_count; ++t) {
-            workers.emplace_back([&, t]() {
-                int neighborhood_len = K;
-                NullBuffer nbuf;
-                std::ostream devnull(&nbuf);
-                bool is_logger_thread = (t == 0);
-
-                while (true) {
-                    if (found.load()) return;
-
-                    RuleJob job;
-
-                    {
-                        std::unique_lock<std::mutex> lock(job_mutex);
-                        job_cv.wait(lock, [&] {
-                            return found.load() || !job_queue.empty() || jobs_done;
-                        });
-                        if (found.load()) return;
-                        if (job_queue.empty()) {
-                            if (jobs_done) return;
-                            continue;
-                        }
-                        job = std::move(job_queue.front());
-                        job_queue.pop_front();
-                    }
-
-                    for (std::size_t jr = 0; jr < job.rules.size() && !found.load(); ++jr) {
-                        const std::vector<char>& rule_bits = job.rules[jr];
-                        long long sym_idx = job.sym_first_idx + static_cast<long long>(jr);
-                        long long base_idx = sym_idx * inv_count;
-
-                        for (std::size_t p_idx = 0;
-                             p_idx < perms.size() && !found.load();
-                             ++p_idx) {
-
-                            long long h_idx0 = base_idx + static_cast<long long>(p_idx);
-                            long long h_id   = h_idx0 + 1;
-                            long long tnum   = tested.fetch_add(1) + 1;
-
-                            bool do_progress = false;
-                            if (is_logger_thread && progress_interval > 0 &&
-                                (tnum % progress_interval == 0)) {
-                                do_progress = true;
-                                std::lock_guard<std::mutex> lock(io_mutex);
-                                std::cout << "r=" << r << " progreso: "
-                                          << tnum << " de "
-                                          << static_cast<long double>(total_H) << "\n";
-                                std::cout.flush();
-                            }
-
-                            // Chequeos sin log (salida a /dev/null)
-                            bool invol_ok = verify_involution_over_tapes(
-                                r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                devnull
-                            );
-                            if (!invol_ok) {
-                                continue;
-                            }
-
-                            ConjugacyResult cr = verify_conjugacy_over_tapes(
-                                r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                devnull
-                            );
-
-                            long double ratio = 0.0L;
-                            if (cr.total > 0) {
-                                ratio = (long double)cr.succeeded / (long double)cr.total;
-                            }
-
-                            bool need_formula_log = cr.full_ok || (ratio >= 0.75L);
-                            bool need_main_log    = do_progress;
-
-                            // Log de muestra cada progress_interval (en rdir/)
-                            if (need_main_log) {
-                                std::filesystem::path main_fpath =
-                                    rdir / ("H_" + std::to_string(h_id) + ".log");
-                                std::ofstream main_log(main_fpath);
-                                if (main_log) {
-                                    main_log << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                             << "\n";
-                                    main_log << fmt_perm(perms[p_idx]) << "\n";
-                                    verify_involution_over_tapes(
-                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                        main_log
-                                    );
-                                    verify_conjugacy_over_tapes(
-                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                        main_log
-                                    );
-                                    if (cr.full_ok) {
-                                        main_log << "ENCONTRADA\n";
-                                    }
-                                    main_log.flush();
-                                }
-                            }
-
-                            // Logs en formula/75 y formula/75/100 para H que pasan >=75%
-                            std::filesystem::path formula_fpath;
-                            if (need_formula_log) {
-                                std::filesystem::path target_dir = formula_rdir / "75";
-                                if (cr.full_ok) {
-                                    target_dir /= "100";
-                                }
-
-                                std::error_code ec_mk;
-                                std::filesystem::create_directories(target_dir, ec_mk);
-
-                                formula_fpath =
-                                    target_dir / ("H_" + std::to_string(h_id) + ".log");
-
-                                std::ofstream f(formula_fpath);
-                                if (f) {
-                                    f << fmt_rule_bits_table(rule_bits, r, neighborhood_len)
-                                      << "\n";
-                                    f << fmt_perm(perms[p_idx]) << "\n";
-                                    verify_involution_over_tapes(
-                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                        f
-                                    );
-                                    verify_conjugacy_over_tapes(
-                                        r, L, neighborhood_len, rule_bits, perms[p_idx],
-                                        f
-                                    );
-                                    if (cr.full_ok) {
-                                        f << "ENCONTRADA\n";
-                                    }
-                                    f.flush();
-                                }
-                            }
-
-                            if (cr.full_ok) {
-                                bool expected = false;
-                                if (found.compare_exchange_strong(expected, true)) {
-                                    std::lock_guard<std::mutex> lock(io_mutex);
-                                    if (need_formula_log) {
-                                        // full_ok => fue a formula/75/100
-                                        found_path = (formula_rdir / "75" / "100" /
-                                                      ("H_" + std::to_string(h_id) + ".log")).string();
-                                    } else if (need_main_log) {
-                                        found_path =
-                                            (rdir / ("H_" + std::to_string(h_id) + ".log")).string();
-                                    } else {
-                                        // Ningún log se generó; al menos indicamos el id
-                                        found_path = "H_" + std::to_string(h_id) + " (sin log)";
-                                    }
-                                    found_r = r;
-                                    std::cout << "H encontrada en r=" << r
-                                              << ", H_id=" << h_id
-                                              << ", archivo=" << found_path << "\n";
-                                    std::cout.flush();
-                                }
-                                return;
-                            }
-                        } // perms
-                    } // reglas del trabajo
-                } // while true
-            }); // worker
-        } // for t
-
-        // Hilo gestor: genera trabajos (RuleJob) en función de chunk_size ~ nº de H
-        long long rules_per_job = chunk_size / inv_count;
-        if (rules_per_job < 1) rules_per_job = 1;
-
-        long long sym_rule_idx = 0;
-        int half = S / 2;
-
-        RuleJob current_job;
-        current_job.sym_first_idx = 0;
-
-        for_each_combination(S, half, [&](const std::vector<int>& ones) {
-            if (found.load()) return;
-
-            std::vector<char> rule_bits(S, '0');
-            for (int idx : ones) rule_bits[idx] = '1';
-
-            if (current_job.rules.empty()) {
-                current_job.sym_first_idx = sym_rule_idx;
-            }
-            current_job.rules.push_back(std::move(rule_bits));
-            ++sym_rule_idx;
-
-            if ((long long)current_job.rules.size() >= rules_per_job) {
-                {
-                    std::lock_guard<std::mutex> lock(job_mutex);
-                    job_queue.push_back(std::move(current_job));
-                }
-                job_cv.notify_one();
-                current_job = RuleJob();
-            }
-        });
-
-        // Último bloque parcial
-        if (!found.load() && !current_job.rules.empty()) {
-            {
-                std::lock_guard<std::mutex> lock(job_mutex);
-                job_queue.push_back(std::move(current_job));
-            }
-            job_cv.notify_all();
-        }
-
-        // Señal de que no habrá más trabajos
-        {
-            std::lock_guard<std::mutex> lock(job_mutex);
-            jobs_done = true;
-        }
-        job_cv.notify_all();
-
-        for (auto& th : workers) th.join();
-
-        if (found.load()) break;
-
-        {
-            std::lock_guard<std::mutex> lock(io_mutex);
-            std::cout << "Terminado r=" << r << " sin encontrar H\n";
-            std::cout.flush();
-        }
-
-        r += 1;
-    }
+    for(auto& t : workers) t.join();
 
     return 0;
 }
